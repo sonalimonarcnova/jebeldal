@@ -1,0 +1,18 @@
+{
+  "name": "jebeldal",
+  "private": true,
+  "scripts": {
+    "mobile:install": "npm --prefix apps/mobile install",
+    "mobile:start": "npm --prefix apps/mobile run start:hosted",
+    "mobile:start:infisical:development": "npm --prefix apps/mobile run start:infisical:development",
+    "mobile:start:infisical:staging": "npm --prefix apps/mobile run start:infisical:staging",
+    "mobile:start:infisical:production": "npm --prefix apps/mobile run start:infisical:production",
+    "mobile:typecheck": "npm --prefix apps/mobile run typecheck",
+    "supabase:migrations:status": "npx supabase migration list --remote=paitemheimctgiqarekt",
+    "supabase:functions:list": "npx supabase functions list --remote=paitemheimctgiqarekt",
+    "supabase:functions:deploy": "npx supabase functions deploy process-incident-turn --remote=paitemheimctgiqarekt --yes && npx supabase functions deploy select-next-question --remote=paitemheimctgiqarekt --yes && npx supabase functions deploy submit-incident --remote=paitemheimctgiqarekt --yes",
+    "supabase:local:start": "npx supabase start",
+    "supabase:local:stop": "npx supabase stop",
+    "supabase:local:status": "npx supabase status -o env"
+  }
+}
