@@ -20,7 +20,7 @@ Related: [MVP technical architecture](./architecture.md) · [MVP user flows and 
 | npm | Workspace script runner | Root scripts orchestrate mobile and Supabase checks. |
 | Hosted Supabase project | Auth, Postgres, Storage, Edge Functions | Current project URL is already configured externally. |
 | Supabase CLI (`supabase`) | Hosted migration/function operations | Use `--remote=<project_ref>` for hosted operations. |
-| Infisical CLI (`infisical`) | Environment-specific secrets injection | Use separate environments for development/staging/production. |
+| Infisical CLI (`infisical`) | Environment-specific secrets injection | Use your real Infisical slugs (`dev`, `staging`, `prod`) unless your project defines different ones. |
 | Physical iOS/Android device | Validate microphone/camera/upload behavior | Simulator is not enough for final voice/media verification. |
 
 ## Repository scaffold status
@@ -79,7 +79,7 @@ npm run mobile:install
 npm run mobile:typecheck
 npm run supabase:migrations:status
 npm run supabase:functions:list
-npm run mobile:start:infisical:development
+npm run mobile:start:infisical:dev
 ```
 
 This confirms:
@@ -87,6 +87,30 @@ This confirms:
 - Hosted migration is present.
 - Hosted Edge Functions are visible.
 - Expo starts with Infisical-injected env vars.
+
+## Seeded development accounts
+
+Use the scripted seed to create Auth users + matching `public.profiles` rows in hosted Supabase.
+
+Prerequisites:
+- `SUPABASE_SERVICE_ROLE_KEY` is available in your shell (recommended via Infisical).
+- Hosted migration and seed have already been applied.
+
+Run:
+
+```bash
+infisical run --env=dev -- npm run seed:dev-accounts
+```
+
+Created accounts:
+
+| Role | Email | Password |
+|---|---|---|
+| driver | `driver+dev1@jebel.local` | `DevDriver#101` |
+| driver | `driver+dev2@jebel.local` | `DevDriver#102` |
+| manager | `manager+dev@jebel.local` | `DevManager#201` |
+
+The script is idempotent and safe to re-run: it reuses existing users by email and upserts profile rows.
 
 ## Run commands (hosted Supabase)
 
@@ -96,20 +120,21 @@ Install dependencies (repo root):
 npm run mobile:install
 ```
 
-Start mobile app with Infisical development secrets injected:
+Start mobile app with Infisical dev secrets injected:
 
 ```bash
-npm run mobile:start:infisical:development
+npm run mobile:start:infisical:dev
 ```
 
 Use the environment-specific variants when needed:
 
 ```bash
 npm run mobile:start:infisical:staging
-npm run mobile:start:infisical:production
+npm run mobile:start:infisical:prod
 ```
 
-`mobile:start` exists but does **not** inject Infisical values. Prefer `mobile:start:infisical:*` for team usage.
+`mobile:start` exists but does **not** inject Infisical values. Prefer `mobile:start:infisical:*` for team usage.  
+Compatibility aliases also exist: `mobile:start:infisical:development` and `mobile:start:infisical:production`.
 
 Other useful hosted commands:
 
@@ -157,6 +182,9 @@ npm run supabase:functions:deploy
 
 - **Error:** mobile starts but auth/network requests fail  
   **Fix:** verify `EXPO_PUBLIC_SUPABASE_URL` and `EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY` in the selected Infisical environment.
+
+- **Error:** seeding script says missing service-role key  
+  **Fix:** add `SUPABASE_SERVICE_ROLE_KEY` to Infisical `dev` (or export manually), then rerun `infisical run --env=dev -- npm run seed:dev-accounts`.
 
 ## Security guardrails
 

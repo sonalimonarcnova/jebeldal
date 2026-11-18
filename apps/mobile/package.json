@@ -22,9 +22,11 @@
   "scripts": {
     "start": "expo start",
     "start:hosted": "expo start",
-    "start:infisical:development": "infisical run --env=development -- npm run start:hosted",
+    "start:infisical:dev": "infisical run --env=dev -- npm run start:hosted",
     "start:infisical:staging": "infisical run --env=staging -- npm run start:hosted",
-    "start:infisical:production": "infisical run --env=production -- npm run start:hosted",
+    "start:infisical:prod": "infisical run --env=prod -- npm run start:hosted",
+    "start:infisical:development": "npm run start:infisical:dev",
+    "start:infisical:production": "npm run start:infisical:prod",
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",

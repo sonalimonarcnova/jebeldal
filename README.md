@@ -17,5 +17,11 @@ Voice-first incident reporting MVP.
 
 ```bash
 npm run mobile:install
-npm run mobile:start:infisical:development
+npm run mobile:start:infisical:dev
+```
+
+Seed development login accounts (hosted Supabase):
+
+```bash
+infisical run --env=dev -- npm run seed:dev-accounts
 ```
