@@ -13,6 +13,11 @@ export type CatalogEntry = {
   extractType: ExtractType;
   description: string;
   options?: string[];
+  /**
+   * The value is the driver's whole story in their own words, so it is exempt from the
+   * value-vs-evidence length check in validate.ts. TODO(E1): carry this flag into graph.ts.
+   */
+  narrative?: true;
 };
 
 const CATALOG: readonly CatalogEntry[] = [
@@ -22,6 +27,7 @@ const CATALOG: readonly CatalogEntry[] = [
     ui: 'voice_open',
     extractType: 'text',
     description: "The driver's own account of the incident, in their words.",
+    narrative: true,
   },
   {
     key: 'involved',
@@ -68,14 +74,18 @@ const CATALOG: readonly CatalogEntry[] = [
     prompt: 'What got damaged, and how bad?',
     ui: 'voice_open',
     extractType: 'text',
-    description: 'Which property or object was damaged and how badly.',
+    description:
+      "Third-party property that was damaged and how badly (fences, buildings, poles, gates, other people's goods). " +
+      "Never the driver's own truck or trailer — damage to the driver's truck belongs only in truck_damage.",
   },
   {
     key: 'property_owner',
     prompt: 'Who owns it?',
     ui: 'voice_open',
     extractType: 'text',
-    description: 'Owner of the damaged property and a contact, if stated.',
+    description:
+      'Owner of the damaged third-party property and a contact, if stated. ' +
+      "Never the driver's own company, truck or trailer.",
   },
   {
     key: 'place_type',

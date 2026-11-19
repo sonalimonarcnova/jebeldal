@@ -328,8 +328,14 @@ async function handle(req: Request): Promise<Response> {
       result = validateProposals(llm.value, transcript, catalog);
 
       // The current open question always keeps the driver's own words if extraction did not fill it.
-      if (question.ui === 'voice_open' && !result.applied.some((p) => p.key === question.key)) {
-        result.applied.push({ key: question.key, value: transcript, confidence: 1, evidence_quote: transcript });
+      // A narrative question (the driver's whole story) always stores the full transcript: models tend to
+      // shorten it, which silently drops facts from the story.
+      const ownWords = { key: question.key, value: transcript, confidence: 1, evidence_quote: transcript };
+      if (question.narrative) {
+        result.applied = [...result.applied.filter((p) => p.key !== question.key), ownWords];
+        result.suggested = result.suggested.filter((p) => p.key !== question.key);
+      } else if (question.ui === 'voice_open' && !result.applied.some((p) => p.key === question.key)) {
+        result.applied.push(ownWords);
         result.suggested = result.suggested.filter((p) => p.key !== question.key);
       }
     }

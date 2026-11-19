@@ -95,6 +95,63 @@ Deno.test('enum_list proposals for one key are merged; enum accepts a one-elemen
   deepStrictEqual(r.applied.find((x) => x.key === 'police')?.value, 'came');
 });
 
+const story =
+  'A silver sedan cut in front of me and my trailer clipped the fence of the gas station. Police came. Front bumper is bent.';
+
+Deno.test("joined quotes ' … ' are accepted when every part is in the transcript", () => {
+  const r = validateProposals(
+    [
+      p('other_vehicle', 'silver sedan', 0.9, 'silver sedan … cut in front of me'),
+      p('witnesses', 'police', 0.9, 'Police came...Front bumper'),
+      p('property_owner', 'gas station', 0.9, 'gas station … the owner was Jen'),
+    ],
+    story,
+    catalog,
+  );
+  deepStrictEqual(r.applied.map((x) => x.key), ['other_vehicle', 'witnesses']);
+  deepStrictEqual(r.rejected.map((x) => [x.key, x.reason]), [['property_owner', 'quote_not_in_transcript']]);
+});
+
+Deno.test('a separator-only quote is rejected', () => {
+  strictEqual(validateProposals([p('police', 'came', 0.9, ' … ')], story, catalog).rejected[0].reason, 'quote_not_in_transcript');
+});
+
+Deno.test('text value with more than 2x the words of its quote is only suggested', () => {
+  const r = validateProposals(
+    [
+      // 7 words vs a 3-word quote → suggested
+      p('property_damaged', 'fence of the gas station and bumper', 0.95, 'clipped the fence'),
+      // 6 words vs a 3-word quote (exactly 2x) → applied
+      p('other_vehicle', 'a silver sedan that cut in', 0.95, 'A silver sedan'),
+    ],
+    story,
+    catalog,
+  );
+  deepStrictEqual(r.applied.map((x) => x.key), ['other_vehicle']);
+  deepStrictEqual(r.suggested.map((x) => [x.key, x.value]), [['property_damaged', 'fence of the gas station and bumper']]);
+});
+
+Deno.test('joined quote counts the words of all parts', () => {
+  const r = validateProposals(
+    [p('property_damaged', 'fence of the gas station', 0.95, 'clipped the fence … gas station')],
+    story,
+    catalog,
+  );
+  deepStrictEqual(r.applied.map((x) => x.key), ['property_damaged']);
+});
+
+Deno.test('narrative questions and enums are exempt from the length check', () => {
+  const r = validateProposals(
+    [
+      p('what_happened', story, 0.95, 'A silver sedan'),
+      p('involved', ['another_vehicle', 'object'], 0.95, 'sedan … fence'),
+    ],
+    story,
+    catalog,
+  );
+  deepStrictEqual(r.applied.map((x) => x.key), ['what_happened', 'involved']);
+});
+
 Deno.test('suggested drops enum keys already applied and list values already applied', () => {
   const r = validateProposals(
     [

@@ -29,9 +29,38 @@ export type ValidationResult = {
 };
 
 const QUOTE_JOINER = ' … ';
+/** Separators allowed between quote parts: the ellipsis character, or three dots, with any spacing. */
+const QUOTE_PART_SPLIT = /\s*(?:…|\.\.\.)\s*/;
+/** A text value longer than this multiple of its evidence (in words) is only suggested, not applied. */
+export const MAX_VALUE_TO_QUOTE_WORDS = 2;
 
 function normalise(text: string): string {
   return text.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/** Non-empty parts of a possibly joined quote ("a … b" → ["a", "b"]). */
+function quoteParts(quote: string): string[] {
+  return quote.split(QUOTE_PART_SPLIT).map((part) => part.trim()).filter((part) => part.length > 0);
+}
+
+export function wordCount(text: string): number {
+  return text.split(/\s+/).filter((word) => /[\p{L}\p{N}]/u.test(word)).length;
+}
+
+/** Every part of the quote must appear in the transcript (case- and whitespace-insensitive). */
+function quoteInTranscript(quote: string, normalisedTranscript: string): boolean {
+  const parts = quoteParts(quote);
+  return parts.length > 0 && parts.every((part) => normalisedTranscript.includes(normalise(part)));
+}
+
+/**
+ * True when a free-text value says much more than its evidence, e.g. value "fence of the gas station and front bumper"
+ * for quote "clipped the fence". Narrative questions (the driver's whole story) are exempt.
+ */
+function exceedsEvidence(entry: CatalogEntry, value: string | string[], quote: string): boolean {
+  if (entry.extractType !== 'text' || entry.narrative || typeof value !== 'string') return false;
+  const quoteWords = quoteParts(quote).reduce((sum, part) => sum + wordCount(part), 0);
+  return wordCount(value) > MAX_VALUE_TO_QUOTE_WORDS * quoteWords;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -64,11 +93,14 @@ function normaliseValue(entry: CatalogEntry, value: unknown): string | string[] 
   return unique;
 }
 
+/** A valid proposal plus whether it says more than its evidence (then it can only be suggested). */
+type Checked = Proposal & { overreach: boolean };
+
 function validateOne(
   raw: unknown,
   normalisedTranscript: string,
   byKey: Map<string, CatalogEntry>,
-): Proposal | Rejected {
+): Checked | Rejected {
   if (!isRecord(raw) || typeof raw.key !== 'string') {
     return { key: null, reason: 'malformed', proposal: raw };
   }
@@ -85,11 +117,11 @@ function validateOne(
   }
 
   const quote = typeof raw.evidence_quote === 'string' ? raw.evidence_quote.trim() : '';
-  if (quote.length === 0 || !normalisedTranscript.includes(normalise(quote))) {
+  if (!quoteInTranscript(quote, normalisedTranscript)) {
     return { key, reason: 'quote_not_in_transcript', proposal: raw };
   }
 
-  return { key, value, confidence, evidence_quote: quote };
+  return { key, value, confidence, evidence_quote: quote, overreach: exceedsEvidence(entry, value, quote) };
 }
 
 /**
@@ -138,9 +170,13 @@ export function validateProposals(
 
   for (const item of Array.isArray(raw) ? raw : []) {
     const result = validateOne(item, normalisedTranscript, byKey);
-    if ('reason' in result) rejected.push(result);
-    else if (result.confidence >= APPLY_THRESHOLD) high.push(result);
-    else low.push(result);
+    if ('reason' in result) {
+      rejected.push(result);
+      continue;
+    }
+    const { overreach, ...proposal } = result;
+    if (proposal.confidence >= APPLY_THRESHOLD && !overreach) high.push(proposal);
+    else low.push(proposal);
   }
 
   const applied = mergeByKey(high, byKey);

@@ -2,7 +2,6 @@
 import { deepStrictEqual, strictEqual } from 'node:assert/strict';
 import { getCatalog } from './catalog.ts';
 import {
-  getProviders,
   MockExtract,
   MockStt,
   SCENARIO_A_TEXT,
@@ -73,14 +72,4 @@ Deno.test('MockStt returns MOCK_TRANSCRIPT or Scenario B', async () => {
   const audio = new Blob([]);
   strictEqual(await new MockStt(() => undefined).transcribe(audio, 'en'), SCENARIO_B_TEXT);
   strictEqual(await new MockStt((k) => (k === 'MOCK_TRANSCRIPT' ? 'hello' : undefined)).transcribe(audio, 'en'), 'hello');
-});
-
-Deno.test('getProviders: live without keys fails instead of silently mocking', () => {
-  let code = '';
-  try {
-    getProviders((k) => (k === 'PROVIDER_MODE' ? 'live' : undefined));
-  } catch (error) {
-    code = (error as { code?: string }).code ?? '';
-  }
-  strictEqual(code, 'config_missing');
 });

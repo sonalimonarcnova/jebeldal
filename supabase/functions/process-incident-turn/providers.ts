@@ -20,7 +20,8 @@ export interface ExtractProvider {
   extract(input: ExtractInput): Promise<RawProposal[]>;
 }
 
-export type ProviderMode = 'mock' | 'live';
+/** mock = no network · groq = Groq STT + Groq extraction · live = Groq STT + OpenAI extraction */
+export type ProviderMode = 'mock' | 'groq' | 'live';
 export type Providers = { mode: ProviderMode; stt: SttProvider; extract: ExtractProvider };
 
 export const PROVIDER_TIMEOUT_MS = 20_000;
@@ -166,6 +167,8 @@ export function buildExtractionInstructions(questionKey: string, catalog: Catalo
     'Rules:',
     '- Never guess or infer beyond what was said. If something is not stated, leave it out.',
     '- evidence_quote must be copied verbatim from the transcript (a short exact substring).',
+    "- A value must be fully supported by its evidence_quote. If it needs two separate parts of the transcript, use those quotes joined with ' … '.",
+    "- property_damaged and property_owner are ONLY third-party property (fences, buildings, poles, other people's goods) — never the driver's own truck or trailer. Damage to the driver's truck goes only to truck_damage.",
     '- For enum questions use only the allowed values; for list questions return an array of allowed values.',
     '- confidence is between 0 and 1: 0.9+ when stated explicitly, lower when implied.',
     '- Return an empty proposals array if nothing applies.',
@@ -198,14 +201,111 @@ export class OpenAiExtract implements ExtractProvider {
     });
 
     const data: unknown = await response.json().catch(() => null);
-    const text = responseOutputText(data);
-    if (text === null) throw new ProviderError('llm_bad_output', true);
-    try {
-      const parsed = JSON.parse(text) as { proposals?: unknown };
-      return Array.isArray(parsed.proposals) ? (parsed.proposals as RawProposal[]) : [];
-    } catch {
-      throw new ProviderError('llm_bad_output', true);
+    return parseProposalsJson(responseOutputText(data));
+  }
+}
+
+export const DEFAULT_GROQ_EXTRACT_MODEL = 'openai/gpt-oss-120b';
+
+type ChatResponseFormat =
+  | { type: 'json_schema'; json_schema: { name: string; strict: true; schema: unknown } }
+  | { type: 'json_object' };
+
+/**
+ * Extraction via Groq's OpenAI-compatible Chat Completions endpoint. Same prompt builder and schema as
+ * OpenAiExtract, so validateProposals and the response contract are identical across modes.
+ * gpt-oss models also get reasoning_effort "low" (latency). On HTTP 400 the request is degraded one step at a
+ * time — first without reasoning_effort, then json_object with the schema spelled out in the system prompt —
+ * and each downgrade is remembered for later calls.
+ */
+export class GroqExtract implements ExtractProvider {
+  private readonly apiKey: string;
+  private readonly model: string;
+  private jsonSchemaSupported = true;
+  private reasoningEffortSupported: boolean;
+  constructor(apiKey: string, model: string = DEFAULT_GROQ_EXTRACT_MODEL) {
+    this.apiKey = apiKey;
+    this.model = model;
+    this.reasoningEffortSupported = model.startsWith('openai/gpt-oss');
+  }
+
+  async extract({ transcript, questionKey, catalog }: ExtractInput): Promise<RawProposal[]> {
+    const instructions = buildExtractionInstructions(questionKey, catalog);
+    const schema = extractionSchema(catalog);
+
+    // At most three attempts: full request → without reasoning_effort → json_object.
+    for (;;) {
+      const useSchema = this.jsonSchemaSupported;
+      const useReasoning = this.reasoningEffortSupported;
+      const system = useSchema
+        ? instructions
+        : `${instructions}\nRespond with a single JSON object matching this JSON Schema:\n${JSON.stringify(schema)}`;
+      const format: ChatResponseFormat = useSchema
+        ? { type: 'json_schema', json_schema: { name: 'proposals', strict: true, schema } }
+        : { type: 'json_object' };
+      try {
+        return await this.call(system, transcript, format, useReasoning);
+      } catch (error) {
+        if (!(error instanceof ProviderError) || error.code !== 'llm_http_400') throw error;
+        if (useReasoning) {
+          this.reasoningEffortSupported = false;
+          this.logFallback('reasoning_effort');
+        } else if (useSchema) {
+          this.jsonSchemaSupported = false;
+          this.logFallback('json_schema');
+        } else {
+          throw error;
+        }
+      }
     }
+  }
+
+  private logFallback(dropped: 'reasoning_effort' | 'json_schema') {
+    console.log(JSON.stringify({ fn: 'process-incident-turn', event: 'groq_request_fallback', dropped, model: this.model }));
+  }
+
+  private async call(
+    system: string,
+    transcript: string,
+    responseFormat: ChatResponseFormat,
+    reasoningLow: boolean,
+  ): Promise<RawProposal[]> {
+    const response = await providerFetch('llm', 'https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: this.model,
+        temperature: 0,
+        ...(reasoningLow ? { reasoning_effort: 'low' } : {}),
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: `Transcript:\n"""${transcript}"""` },
+        ],
+        response_format: responseFormat,
+      }),
+    });
+    const data: unknown = await response.json().catch(() => null);
+    return parseProposalsJson(chatContent(data));
+  }
+}
+
+/** First choice's message content from a Chat Completions payload. */
+function chatContent(data: unknown): string | null {
+  const choices = (data as { choices?: unknown } | null)?.choices;
+  if (!Array.isArray(choices) || choices.length === 0) return null;
+  const message = (choices[0] as { message?: { content?: unknown; refusal?: unknown } }).message;
+  if (typeof message?.refusal === 'string' && message.refusal) throw new ProviderError('llm_refusal', false);
+  return typeof message?.content === 'string' ? message.content : null;
+}
+
+/** Parses `{ "proposals": [...] }`; validation of each item happens later in validateProposals. */
+function parseProposalsJson(text: string | null): RawProposal[] {
+  if (text === null) throw new ProviderError('llm_bad_output', true);
+  try {
+    const parsed = JSON.parse(text) as { proposals?: unknown };
+    return Array.isArray(parsed.proposals) ? (parsed.proposals as RawProposal[]) : [];
+  } catch {
+    throw new ProviderError('llm_bad_output', true);
   }
 }
 
@@ -302,28 +402,42 @@ export class MockExtract implements ExtractProvider {
 // ---------------------------------------------------------------------------
 // Selection
 // ---------------------------------------------------------------------------
-let cached: Providers | null = null;
+function configMissing(mode: ProviderMode): never {
+  console.error(JSON.stringify({ fn: 'process-incident-turn', event: 'provider_config_missing', mode }));
+  throw new ProviderError('config_missing', false);
+}
 
 /**
- * PROVIDER_MODE=live → Groq + OpenAI (GROQ_API_KEY, OPENAI_API_KEY and OPENAI_MODEL required; missing keys
- * throw `config_missing` rather than silently falling back to mock). Anything else → mock.
+ * Pure selection from env (no caching, no mode log):
+ * - PROVIDER_MODE=groq → GroqStt + GroqExtract; needs GROQ_API_KEY (GROQ_EXTRACT_MODEL optional).
+ * - PROVIDER_MODE=live → GroqStt + OpenAiExtract; needs GROQ_API_KEY, OPENAI_API_KEY, OPENAI_MODEL.
+ * - anything else → mock.
+ * Missing keys throw `config_missing` rather than silently falling back to mock.
  */
-export function getProviders(env: EnvReader = readEnv): Providers {
-  if (cached) return cached;
-
-  if (env('PROVIDER_MODE') === 'live') {
+export function selectProviders(env: EnvReader = readEnv): Providers {
+  const mode = env('PROVIDER_MODE')?.trim().toLowerCase();
+  if (mode === 'groq') {
+    const groqKey = env('GROQ_API_KEY');
+    if (!groqKey) configMissing('groq');
+    const model = env('GROQ_EXTRACT_MODEL')?.trim() || DEFAULT_GROQ_EXTRACT_MODEL;
+    return { mode: 'groq', stt: new GroqStt(groqKey), extract: new GroqExtract(groqKey, model) };
+  }
+  if (mode === 'live') {
     const groqKey = env('GROQ_API_KEY');
     const openAiKey = env('OPENAI_API_KEY');
     const model = env('OPENAI_MODEL');
-    if (!groqKey || !openAiKey || !model) {
-      console.error(JSON.stringify({ fn: 'process-incident-turn', event: 'provider_config_missing', mode: 'live' }));
-      throw new ProviderError('config_missing', false);
-    }
-    cached = { mode: 'live', stt: new GroqStt(groqKey), extract: new OpenAiExtract(openAiKey, model) };
-  } else {
-    cached = { mode: 'mock', stt: new MockStt(env), extract: new MockExtract() };
+    if (!groqKey || !openAiKey || !model) configMissing('live');
+    return { mode: 'live', stt: new GroqStt(groqKey), extract: new OpenAiExtract(openAiKey, model) };
   }
+  return { mode: 'mock', stt: new MockStt(env), extract: new MockExtract() };
+}
 
+let cached: Providers | null = null;
+
+/** Process-wide providers, selected once from the function's env; logs the mode on first use. */
+export function getProviders(): Providers {
+  if (cached) return cached;
+  cached = selectProviders();
   console.log(JSON.stringify({ fn: 'process-incident-turn', event: 'provider_mode', mode: cached.mode }));
   return cached;
 }
