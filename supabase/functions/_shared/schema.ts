@@ -4,6 +4,7 @@ export const incidentTurnSchema = z
   .object({
     incident_revision_id: z.string().uuid(),
     client_turn_id: z.string().min(1),
+    question_key: z.string().min(1),
     audio_evidence_id: z.string().uuid().optional(),
     text: z.string().min(1).optional(),
   })
