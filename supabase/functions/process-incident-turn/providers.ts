@@ -21,8 +21,8 @@ export interface ExtractProvider {
   extract(input: ExtractInput): Promise<RawProposal[]>;
 }
 
-/** mock = no network · groq = Groq STT + Groq extraction · live = Groq STT + OpenAI extraction */
-export type ProviderMode = 'mock' | 'groq' | 'live';
+/** mock = no network · groq = Groq STT + Groq extraction · xai = xAI STT + xAI extraction · live = Groq STT + OpenAI extraction */
+export type ProviderMode = 'mock' | 'groq' | 'xai' | 'live';
 export type Providers = { mode: ProviderMode; stt: SttProvider; extract: ExtractProvider };
 
 export const PROVIDER_TIMEOUT_MS = 20_000;
@@ -49,9 +49,15 @@ const safeIdentifier = (value: unknown) => (typeof value === 'string' && IDENTIF
 
 /** Reads only `error.type` / `error.code` from an error body; the human-readable message is discarded. */
 async function errorInfo(response: Response): Promise<ProviderErrorInfo> {
-  const body: unknown = await response.json().catch(() => null);
-  const error = (body as { error?: { type?: unknown; code?: unknown } } | null)?.error;
-  return { status: response.status, type: safeIdentifier(error?.type), code: safeIdentifier(error?.code) };
+  const body = (await response.json().catch(() => null)) as { error?: unknown; code?: unknown; type?: unknown } | null;
+  // OpenAI/Groq: { error: { type, code, message } }. Others (e.g. xAI) may put code/type at the top level and a
+  // message string in `error` — the string is never read.
+  const nested = typeof body?.error === 'object' && body.error !== null ? (body.error as { type?: unknown; code?: unknown }) : null;
+  return {
+    status: response.status,
+    type: safeIdentifier(nested?.type ?? body?.type),
+    code: safeIdentifier(nested?.code ?? body?.code),
+  };
 }
 
 type EnvReader = (name: string) => string | undefined;
@@ -128,6 +134,41 @@ export class GroqStt implements SttProvider {
     form.append('temperature', '0');
 
     const response = await providerFetch('stt', 'https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.apiKey}` },
+      body: form,
+    });
+    const data: unknown = await response.json().catch(() => null);
+    const text = (data as { text?: unknown } | null)?.text;
+    if (typeof text !== 'string') throw new ProviderError('stt_bad_output', true);
+    return text.trim();
+  }
+}
+
+export const XAI_STT_MODEL = 'grok-voice-transcribe-2.0';
+/** Languages for which xAI supports `format=true` (inverse text normalisation: "two thirty five" → "235"). */
+const XAI_FORMAT_LANGUAGES = new Set(['ar', 'de', 'en', 'es', 'fr', 'ja', 'pt', 'ru', 'sv', 'vi', 'zh']);
+
+/**
+ * xAI speech-to-text (POST https://api.x.ai/v1/stt, multipart). Option fields go BEFORE `file`: the docs say
+ * `file` must be the last field and fields after it may be ignored. Container formats (m4a/mp4/wav…) are
+ * auto-detected, so `audio_format` / `sample_rate` are not sent.
+ */
+export class XaiStt implements SttProvider {
+  private readonly apiKey: string;
+  constructor(apiKey: string) {
+    this.apiKey = apiKey;
+  }
+
+  async transcribe(audio: Blob, lang: string, filename?: string): Promise<string> {
+    const name = filename ?? `audio.${AUDIO_EXTENSIONS[audio.type] ?? 'm4a'}`;
+    const form = new FormData();
+    form.append('model', XAI_STT_MODEL);
+    form.append('language', lang);
+    if (XAI_FORMAT_LANGUAGES.has(lang)) form.append('format', 'true'); // requires language
+    form.append('file', audio, name); // must be last
+
+    const response = await providerFetch('stt', 'https://api.x.ai/v1/stt', {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.apiKey}` },
       body: form,
@@ -222,27 +263,33 @@ export class OpenAiExtract implements ExtractProvider {
 }
 
 export const DEFAULT_GROQ_EXTRACT_MODEL = 'openai/gpt-oss-120b';
+/** Chosen by benchmark on 2026-11-19 (fastest Grok text model that honours strict json_schema). */
+export const DEFAULT_XAI_EXTRACT_MODEL = 'grok-4.20-0309-non-reasoning';
 
 type ChatResponseFormat =
   | { type: 'json_schema'; json_schema: { name: string; strict: true; schema: unknown } }
   | { type: 'json_object' };
 
 /**
- * Extraction via Groq's OpenAI-compatible Chat Completions endpoint. Same prompt builder and schema as
+ * Extraction via an OpenAI-compatible Chat Completions endpoint (Groq, xAI). Same prompt builder and schema as
  * OpenAiExtract, so validateProposals and the response contract are identical across modes.
- * gpt-oss models also get reasoning_effort "low" (latency). On HTTP 400 the request is degraded one step at a
+ * Optionally sends reasoning_effort "low" (latency). On HTTP 400 the request is degraded one step at a
  * time — first without reasoning_effort, then json_object with the schema spelled out in the system prompt —
  * and each downgrade is remembered for later calls.
  */
-export class GroqExtract implements ExtractProvider {
+class ChatCompletionsExtract implements ExtractProvider {
   private readonly apiKey: string;
   private readonly model: string;
+  private readonly endpoint: string;
+  private readonly provider: string;
   private jsonSchemaSupported = true;
   private reasoningEffortSupported: boolean;
-  constructor(apiKey: string, model: string = DEFAULT_GROQ_EXTRACT_MODEL) {
-    this.apiKey = apiKey;
-    this.model = model;
-    this.reasoningEffortSupported = model.startsWith('openai/gpt-oss');
+  constructor(opts: { apiKey: string; model: string; endpoint: string; provider: string; reasoningEffortLow: boolean }) {
+    this.apiKey = opts.apiKey;
+    this.model = opts.model;
+    this.endpoint = opts.endpoint;
+    this.provider = opts.provider;
+    this.reasoningEffortSupported = opts.reasoningEffortLow;
   }
 
   async extract({ transcript, questionKey, catalog }: ExtractInput): Promise<RawProposal[]> {
@@ -277,7 +324,9 @@ export class GroqExtract implements ExtractProvider {
   }
 
   private logFallback(dropped: 'reasoning_effort' | 'json_schema') {
-    console.log(JSON.stringify({ fn: 'process-incident-turn', event: 'groq_request_fallback', dropped, model: this.model }));
+    console.log(
+      JSON.stringify({ fn: 'process-incident-turn', event: 'extract_request_fallback', provider: this.provider, dropped, model: this.model }),
+    );
   }
 
   private async call(
@@ -286,7 +335,7 @@ export class GroqExtract implements ExtractProvider {
     responseFormat: ChatResponseFormat,
     reasoningLow: boolean,
   ): Promise<RawProposal[]> {
-    const response = await providerFetch('llm', 'https://api.groq.com/openai/v1/chat/completions', {
+    const response = await providerFetch('llm', this.endpoint, {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -302,6 +351,26 @@ export class GroqExtract implements ExtractProvider {
     });
     const data: unknown = await response.json().catch(() => null);
     return parseProposalsJson(chatContent(data));
+  }
+}
+
+/** Groq chat completions; gpt-oss models get reasoning_effort "low". */
+export class GroqExtract extends ChatCompletionsExtract {
+  constructor(apiKey: string, model: string = DEFAULT_GROQ_EXTRACT_MODEL) {
+    super({
+      apiKey,
+      model,
+      endpoint: 'https://api.groq.com/openai/v1/chat/completions',
+      provider: 'groq',
+      reasoningEffortLow: model.startsWith('openai/gpt-oss'),
+    });
+  }
+}
+
+/** xAI (Grok) chat completions. No reasoning_effort: the default model is a non-reasoning variant. */
+export class XaiExtract extends ChatCompletionsExtract {
+  constructor(apiKey: string, model: string = DEFAULT_XAI_EXTRACT_MODEL) {
+    super({ apiKey, model, endpoint: 'https://api.x.ai/v1/chat/completions', provider: 'xai', reasoningEffortLow: false });
   }
 }
 
@@ -425,6 +494,7 @@ function configMissing(mode: ProviderMode): never {
 
 /**
  * Pure selection from env (no caching, no mode log):
+ * - PROVIDER_MODE=xai  → XaiStt + XaiExtract; needs XAI_API_KEY (XAI_EXTRACT_MODEL optional).
  * - PROVIDER_MODE=groq → GroqStt + GroqExtract; needs GROQ_API_KEY (GROQ_EXTRACT_MODEL optional).
  * - PROVIDER_MODE=live → GroqStt + OpenAiExtract; needs GROQ_API_KEY, OPENAI_API_KEY, OPENAI_MODEL.
  * - anything else → mock.
@@ -432,6 +502,12 @@ function configMissing(mode: ProviderMode): never {
  */
 export function selectProviders(env: EnvReader = readEnv): Providers {
   const mode = env('PROVIDER_MODE')?.trim().toLowerCase();
+  if (mode === 'xai') {
+    const xaiKey = env('XAI_API_KEY')?.trim();
+    if (!xaiKey) configMissing('xai');
+    const model = env('XAI_EXTRACT_MODEL')?.trim() || DEFAULT_XAI_EXTRACT_MODEL;
+    return { mode: 'xai', stt: new XaiStt(xaiKey), extract: new XaiExtract(xaiKey, model) };
+  }
   if (mode === 'groq') {
     const groqKey = env('GROQ_API_KEY');
     if (!groqKey) configMissing('groq');

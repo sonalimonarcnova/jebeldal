@@ -4,12 +4,16 @@ import { getCatalog } from './catalog.ts';
 import {
   buildExtractionInstructions,
   DEFAULT_GROQ_EXTRACT_MODEL,
+  DEFAULT_XAI_EXTRACT_MODEL,
   GroqExtract,
   GroqStt,
   MockExtract,
   MockStt,
   OpenAiExtract,
   selectProviders,
+  XAI_STT_MODEL,
+  XaiExtract,
+  XaiStt,
 } from './providers.ts';
 
 const envOf = (vars: Record<string, string>) => (name: string) => vars[name];
@@ -46,6 +50,20 @@ Deno.test('groq: mode value is case/whitespace tolerant', () => {
 Deno.test('groq: missing GROQ_API_KEY is config_missing (OpenAI keys do not help)', () => {
   strictEqual(configError({ PROVIDER_MODE: 'groq' }), 'config_missing');
   strictEqual(configError({ PROVIDER_MODE: 'groq', OPENAI_API_KEY: 'o', OPENAI_MODEL: 'm' }), 'config_missing');
+});
+
+Deno.test('xai: xAI STT + xAI extraction with only XAI_API_KEY; default and override model', () => {
+  const p = selectProviders(envOf({ PROVIDER_MODE: 'xai', XAI_API_KEY: 'xai-k' }));
+  strictEqual(p.mode, 'xai');
+  ok(p.stt instanceof XaiStt);
+  ok(p.extract instanceof XaiExtract);
+  strictEqual(selectProviders(envOf({ PROVIDER_MODE: 'XAI ', XAI_API_KEY: 'xai-k' })).mode, 'xai');
+});
+
+Deno.test('xai: missing or blank XAI_API_KEY is config_missing (a Groq key does not help)', () => {
+  strictEqual(configError({ PROVIDER_MODE: 'xai' }), 'config_missing');
+  strictEqual(configError({ PROVIDER_MODE: 'xai', XAI_API_KEY: '   ' }), 'config_missing');
+  strictEqual(configError({ PROVIDER_MODE: 'xai', GROQ_API_KEY: 'gsk_k' }), 'config_missing');
 });
 
 Deno.test('live: Groq STT + OpenAI extraction; needs all three variables', () => {
@@ -194,6 +212,98 @@ Deno.test('GroqStt sends the given filename, model, language and response_format
   } finally {
     globalThis.fetch = original;
   }
+});
+
+type SentRequest = { url: string; headers: Headers; body: BodyInit | null | undefined };
+
+async function captureOne(responseBody: unknown, status: number, fn: () => Promise<unknown>): Promise<{ sent: SentRequest; result: unknown }> {
+  const original = globalThis.fetch;
+  let sent: SentRequest | null = null;
+  globalThis.fetch = ((url: string, init?: RequestInit) => {
+    sent = { url: String(url), headers: new Headers(init?.headers), body: init?.body };
+    return Promise.resolve(new Response(JSON.stringify(responseBody), { status }));
+  }) as typeof fetch;
+  try {
+    const result = await fn().catch((e) => e);
+    return { sent: sent as unknown as SentRequest, result };
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+Deno.test('XaiStt: POST /v1/stt, bearer auth, option fields before file, file last with filename + type', async () => {
+  const audio = new Blob([new Uint8Array(8)], { type: 'audio/mp4' });
+  const { sent, result } = await captureOne({ text: ' Police came. ', language: 'en', duration: 1.2 }, 200, () =>
+    new XaiStt('xai-k').transcribe(audio, 'en', 'audio.m4a'),
+  );
+  strictEqual(result, 'Police came.');
+  strictEqual(sent.url, 'https://api.x.ai/v1/stt');
+  strictEqual(sent.headers.get('authorization'), 'Bearer xai-k');
+  const form = sent.body as FormData;
+  deepStrictEqual([...form.keys()], ['model', 'language', 'format', 'file']);
+  strictEqual(form.get('model'), XAI_STT_MODEL);
+  strictEqual(form.get('language'), 'en');
+  strictEqual(form.get('format'), 'true');
+  strictEqual((form.get('file') as File).name, 'audio.m4a');
+  strictEqual((form.get('file') as File).type, 'audio/mp4');
+});
+
+Deno.test('XaiStt: format=true only for languages that support it', async () => {
+  const audio = new Blob([new Uint8Array(8)], { type: 'audio/mp4' });
+  const { sent } = await captureOne({ text: 'hola' }, 200, () => new XaiStt('xai-k').transcribe(audio, 'hi', 'audio.m4a'));
+  deepStrictEqual([...(sent.body as FormData).keys()], ['model', 'language', 'file']);
+});
+
+Deno.test('XaiStt: 401 / 429 / 503 map to safe codes; message text is never kept', async () => {
+  const audio = new Blob([new Uint8Array(8)], { type: 'audio/mp4' });
+  const cases: Array<[number, string, boolean]> = [
+    [401, 'stt_http_401', false],
+    [403, 'stt_http_403', false],
+    [429, 'stt_http_429', true],
+    [503, 'stt_http_503', true],
+  ];
+  for (const [status, code, retryable] of cases) {
+    const { result } = await captureOne({ code: 'Incorrect API key provided', error: 'secret-ish detail' }, status, () =>
+      new XaiStt('xai-k').transcribe(audio, 'en', 'audio.m4a'),
+    );
+    const error = result as { code: string; retryable: boolean; info: Record<string, unknown> };
+    strictEqual(error.code, code);
+    strictEqual(error.retryable, retryable);
+    // A sentence-like "code" is not an identifier, so it is dropped too.
+    deepStrictEqual(error.info, { status, type: undefined, code: undefined });
+  }
+});
+
+Deno.test('XaiExtract: chat completions at api.x.ai, default model, strict json_schema, temperature 0, no reasoning_effort', async () => {
+  const { sent, result } = await captureOne(chat(JSON.stringify(proposals)), 200, () => new XaiExtract('xai-k').extract(input));
+  deepStrictEqual(result, proposals.proposals);
+  strictEqual(sent.url, 'https://api.x.ai/v1/chat/completions');
+  strictEqual(sent.headers.get('authorization'), 'Bearer xai-k');
+  strictEqual(sent.headers.get('content-type'), 'application/json');
+  const body = JSON.parse(String(sent.body));
+  strictEqual(body.model, DEFAULT_XAI_EXTRACT_MODEL);
+  strictEqual(body.temperature, 0);
+  strictEqual(body.reasoning_effort, undefined);
+  strictEqual(body.response_format.type, 'json_schema');
+  strictEqual(body.response_format.json_schema.strict, true);
+});
+
+Deno.test('XaiExtract: json_schema rejected (400) falls back to json_object and remembers it', async () => {
+  await withFetch(
+    [
+      { status: 400, body: { code: 'invalid_argument', error: 'response_format not supported' } },
+      { status: 200, body: chat(JSON.stringify(proposals)) },
+    ],
+    async (calls) => {
+      const extractor = new XaiExtract('xai-k', 'grok-x');
+      deepStrictEqual(await extractor.extract(input), proposals.proposals);
+      await extractor.extract(input);
+      deepStrictEqual(
+        calls.map((c) => [c.body.model, (c.body.response_format as { type: string }).type]),
+        [['grok-x', 'json_schema'], ['grok-x', 'json_object'], ['grok-x', 'json_object']],
+      );
+    },
+  );
 });
 
 Deno.test('extraction prompt carries the third-party property and evidence rules', () => {

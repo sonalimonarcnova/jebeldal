@@ -21,7 +21,7 @@ export const processTurnResponseSchema = z.object({
   applied: z.array(proposalSchema),
   suggested: z.array(proposalSchema),
   latency_ms: z.object({ stt: z.number(), llm: z.number() }),
-  mode: z.enum(['mock', 'groq', 'live']),
+  mode: z.enum(['mock', 'groq', 'xai', 'live']),
   kept_existing: z.array(z.string()).default([]),
 });
 export type ProcessTurnResponse = z.infer<typeof processTurnResponseSchema>;
