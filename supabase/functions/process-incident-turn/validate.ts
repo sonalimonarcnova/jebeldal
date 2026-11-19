@@ -1,0 +1,198 @@
+// Pure validation of extraction proposals. No I/O, no runtime-specific APIs.
+import type { CatalogEntry } from './catalog.ts';
+
+export const APPLY_THRESHOLD = 0.8;
+
+/** A validated proposal. `value` is a string for text/enum keys and a string[] for enum_list keys. */
+export type Proposal = {
+  key: string;
+  value: string | string[];
+  confidence: number;
+  evidence_quote: string;
+};
+
+export type RejectReason =
+  | 'malformed'
+  | 'unknown_key'
+  | 'invalid_value'
+  | 'invalid_confidence'
+  | 'quote_not_in_transcript';
+
+export type Rejected = { key: string | null; reason: RejectReason; proposal: unknown };
+
+export type ValidationResult = {
+  /** confidence ≥ APPLY_THRESHOLD, one entry per key */
+  applied: Proposal[];
+  /** valid but below threshold, one entry per key; enum/text keys already applied are dropped */
+  suggested: Proposal[];
+  rejected: Rejected[];
+};
+
+const QUOTE_JOINER = ' … ';
+/** Separators allowed between quote parts: the ellipsis character, or three dots, with any spacing. */
+const QUOTE_PART_SPLIT = /\s*(?:…|\.\.\.)\s*/;
+/** A text value longer than this multiple of its evidence (in words) is only suggested, not applied. */
+export const MAX_VALUE_TO_QUOTE_WORDS = 2;
+
+function normalise(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/** Non-empty parts of a possibly joined quote ("a … b" → ["a", "b"]). */
+function quoteParts(quote: string): string[] {
+  return quote.split(QUOTE_PART_SPLIT).map((part) => part.trim()).filter((part) => part.length > 0);
+}
+
+export function wordCount(text: string): number {
+  return text.split(/\s+/).filter((word) => /[\p{L}\p{N}]/u.test(word)).length;
+}
+
+/** Every part of the quote must appear in the transcript (case- and whitespace-insensitive). */
+function quoteInTranscript(quote: string, normalisedTranscript: string): boolean {
+  const parts = quoteParts(quote);
+  return parts.length > 0 && parts.every((part) => normalisedTranscript.includes(normalise(part)));
+}
+
+/**
+ * True when a free-text value says much more than its evidence, e.g. value "fence of the gas station and front bumper"
+ * for quote "clipped the fence". Narrative questions (the driver's whole story) are exempt.
+ */
+function exceedsEvidence(entry: CatalogEntry, value: string | string[], quote: string): boolean {
+  if (entry.extractType !== 'text' || entry.narrative || typeof value !== 'string') return false;
+  const quoteWords = quoteParts(quote).reduce((sum, part) => sum + wordCount(part), 0);
+  return wordCount(value) > MAX_VALUE_TO_QUOTE_WORDS * quoteWords;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Returns the normalised value for the entry, or null if it is not allowed. */
+function normaliseValue(entry: CatalogEntry, value: unknown): string | string[] | null {
+  if (entry.extractType === 'text') {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+
+  const options = entry.options ?? [];
+  if (entry.extractType === 'enum') {
+    // A one-element array is accepted for single-choice keys (the LLM schema allows string | string[]).
+    const single = Array.isArray(value) && value.length === 1 ? value[0] : value;
+    return typeof single === 'string' && options.includes(single) ? single : null;
+  }
+
+  // enum_list: a bare string is treated as a one-element list.
+  const list = typeof value === 'string' ? [value] : value;
+  if (!Array.isArray(list) || list.length === 0) return null;
+  const unique: string[] = [];
+  for (const item of list) {
+    if (typeof item !== 'string' || !options.includes(item)) return null;
+    if (!unique.includes(item)) unique.push(item);
+  }
+  return unique;
+}
+
+/** A valid proposal plus whether it says more than its evidence (then it can only be suggested). */
+type Checked = Proposal & { overreach: boolean };
+
+function validateOne(
+  raw: unknown,
+  normalisedTranscript: string,
+  byKey: Map<string, CatalogEntry>,
+): Checked | Rejected {
+  if (!isRecord(raw) || typeof raw.key !== 'string') {
+    return { key: null, reason: 'malformed', proposal: raw };
+  }
+  const key = raw.key;
+  const entry = byKey.get(key);
+  if (!entry) return { key, reason: 'unknown_key', proposal: raw };
+
+  const value = normaliseValue(entry, raw.value);
+  if (value === null) return { key, reason: 'invalid_value', proposal: raw };
+
+  const confidence = raw.confidence;
+  if (typeof confidence !== 'number' || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+    return { key, reason: 'invalid_confidence', proposal: raw };
+  }
+
+  const quote = typeof raw.evidence_quote === 'string' ? raw.evidence_quote.trim() : '';
+  if (!quoteInTranscript(quote, normalisedTranscript)) {
+    return { key, reason: 'quote_not_in_transcript', proposal: raw };
+  }
+
+  return { key, value, confidence, evidence_quote: quote, overreach: exceedsEvidence(entry, value, quote) };
+}
+
+/**
+ * Collapses several proposals for the same key into one.
+ * enum_list: union of values (catalog option order), lowest confidence, quotes joined with " … ".
+ * text / enum: the highest-confidence proposal wins.
+ */
+function mergeByKey(proposals: Proposal[], byKey: Map<string, CatalogEntry>): Proposal[] {
+  const merged = new Map<string, Proposal>();
+  for (const p of proposals) {
+    const current = merged.get(p.key);
+    if (!current) {
+      merged.set(p.key, { ...p, value: Array.isArray(p.value) ? [...p.value] : p.value });
+      continue;
+    }
+    const entry = byKey.get(p.key);
+    if (entry?.extractType === 'enum_list' && Array.isArray(current.value) && Array.isArray(p.value)) {
+      const options = entry.options ?? [];
+      const union = new Set([...current.value, ...p.value]);
+      const quotes = current.evidence_quote.split(QUOTE_JOINER);
+      if (!quotes.includes(p.evidence_quote)) quotes.push(p.evidence_quote);
+      merged.set(p.key, {
+        key: p.key,
+        value: options.filter((o) => union.has(o)),
+        confidence: Math.min(current.confidence, p.confidence),
+        evidence_quote: quotes.join(QUOTE_JOINER),
+      });
+    } else if (p.confidence > current.confidence) {
+      merged.set(p.key, p);
+    }
+  }
+  return [...merged.values()];
+}
+
+export function validateProposals(
+  raw: readonly unknown[],
+  transcript: string,
+  catalog: readonly CatalogEntry[],
+): ValidationResult {
+  const byKey = new Map(catalog.map((entry) => [entry.key, entry]));
+  const normalisedTranscript = normalise(transcript);
+
+  const high: Proposal[] = [];
+  const low: Proposal[] = [];
+  const rejected: Rejected[] = [];
+
+  for (const item of Array.isArray(raw) ? raw : []) {
+    const result = validateOne(item, normalisedTranscript, byKey);
+    if ('reason' in result) {
+      rejected.push(result);
+      continue;
+    }
+    const { overreach, ...proposal } = result;
+    if (proposal.confidence >= APPLY_THRESHOLD && !overreach) high.push(proposal);
+    else low.push(proposal);
+  }
+
+  const applied = mergeByKey(high, byKey);
+  const appliedByKey = new Map(applied.map((p) => [p.key, p]));
+  const suggested: Proposal[] = [];
+  for (const p of mergeByKey(low, byKey)) {
+    const done = appliedByKey.get(p.key);
+    if (!done) {
+      suggested.push(p);
+    } else if (Array.isArray(p.value) && Array.isArray(done.value)) {
+      // enum_list: only suggest values that were not already applied.
+      const doneValues = done.value;
+      const rest = p.value.filter((v) => !doneValues.includes(v));
+      if (rest.length > 0) suggested.push({ ...p, value: rest });
+    }
+  }
+
+  return { applied, suggested, rejected };
+}
