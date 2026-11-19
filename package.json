@@ -14,7 +14,7 @@
     "seed:dev-accounts": "node ./scripts/seed-hosted-dev-accounts.mjs",
     "supabase:migrations:status": "npx supabase migration list --remote=paitemheimctgiqarekt",
     "supabase:functions:list": "npx supabase functions list --remote=paitemheimctgiqarekt",
-    "supabase:functions:deploy": "npx supabase functions deploy process-incident-turn --remote=paitemheimctgiqarekt --yes && npx supabase functions deploy select-next-question --remote=paitemheimctgiqarekt --yes && npx supabase functions deploy submit-incident --remote=paitemheimctgiqarekt --yes",
+    "supabase:functions:deploy": "npx supabase functions deploy process-incident-turn --remote=paitemheimctgiqarekt --yes && npx supabase functions deploy generate-summary --remote=paitemheimctgiqarekt --yes && npx supabase functions deploy select-next-question --remote=paitemheimctgiqarekt --yes && npx supabase functions deploy submit-incident --remote=paitemheimctgiqarekt --yes",
     "supabase:local:start": "npx supabase start",
     "supabase:local:stop": "npx supabase stop",
     "supabase:local:status": "npx supabase status -o env"

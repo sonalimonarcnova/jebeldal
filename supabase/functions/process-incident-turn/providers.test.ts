@@ -28,7 +28,13 @@ function configError(vars: Record<string, string>): string {
 }
 
 Deno.test('mock is the default (unset, empty, unknown or explicit mock)', () => {
-  for (const vars of [{}, { PROVIDER_MODE: '' }, { PROVIDER_MODE: 'banana' }, { PROVIDER_MODE: 'mock', GROQ_API_KEY: 'k' }]) {
+  const configurations: Record<string, string>[] = [
+    {},
+    { PROVIDER_MODE: '' },
+    { PROVIDER_MODE: 'banana' },
+    { PROVIDER_MODE: 'mock', GROQ_API_KEY: 'k' },
+  ];
+  for (const vars of configurations) {
     const p = selectProviders(envOf(vars));
     strictEqual(p.mode, 'mock');
     ok(p.stt instanceof MockStt);

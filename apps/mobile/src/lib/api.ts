@@ -31,6 +31,13 @@ export const processTurnResponseSchema = z.object({
 });
 export type ProcessTurnResponse = z.infer<typeof processTurnResponseSchema>;
 
+export const generateSummaryResponseSchema = z.object({
+  descriptions: z.record(z.string(), z.string().trim().min(1).max(600)),
+  mode: z.enum(['mock', 'groq', 'xai', 'live']),
+  latency_ms: z.number().int().nonnegative(),
+});
+export type GenerateSummaryResponse = z.infer<typeof generateSummaryResponseSchema>;
+
 /** Error codes of the team's _shared/backend.ts envelope ({ code, message?, retryable? }). */
 export const contractErrorCodes = [
   'AUTH_REQUIRED',
@@ -109,6 +116,21 @@ export async function processTurn(input: ProcessTurnInput): Promise<ApiResult<Pr
   if (result.error) return errorFromInvoke(result.error);
 
   const parsed = processTurnResponseSchema.safeParse(result.data);
+  return parsed.success ? { ok: true, data: parsed.data } : BAD_RESPONSE;
+}
+
+export async function generateSummary(revisionId: string): Promise<ApiResult<GenerateSummaryResponse>> {
+  let result: Awaited<ReturnType<typeof supabase.functions.invoke>>;
+  try {
+    result = await supabase.functions.invoke('generate-summary', {
+      body: { incident_revision_id: revisionId },
+    });
+  } catch {
+    return NETWORK_ERROR;
+  }
+  if (result.error) return errorFromInvoke(result.error);
+
+  const parsed = generateSummaryResponseSchema.safeParse(result.data);
   return parsed.success ? { ok: true, data: parsed.data } : BAD_RESPONSE;
 }
 

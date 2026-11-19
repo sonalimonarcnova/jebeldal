@@ -32,6 +32,10 @@ export const selectNextQuestionSchema = z.object({
   incident_revision_id: z.string().uuid(),
 });
 
+export const generateSummarySchema = z.object({
+  incident_revision_id: z.string().uuid(),
+});
+
 export const submitIncidentSchema = z.object({
   incident_revision_id: z.string().uuid(),
   expected_version: z.number().int().positive(),

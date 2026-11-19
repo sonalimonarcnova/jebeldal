@@ -89,7 +89,7 @@ export const SCENARIO_C_TEXT =
 // ---------------------------------------------------------------------------
 // HTTP helper with timeout and safe error codes
 // ---------------------------------------------------------------------------
-async function providerFetch(stage: 'stt' | 'llm', url: string, init: RequestInit): Promise<Response> {
+export async function providerFetch(stage: 'stt' | 'llm', url: string, init: RequestInit): Promise<Response> {
   let response: Response;
   try {
     response = await fetch(url, { ...init, signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS) });
@@ -383,7 +383,7 @@ export class XaiExtract extends ChatCompletionsExtract {
 }
 
 /** First choice's message content from a Chat Completions payload. */
-function chatContent(data: unknown): string | null {
+export function chatContent(data: unknown): string | null {
   const choices = (data as { choices?: unknown } | null)?.choices;
   if (!Array.isArray(choices) || choices.length === 0) return null;
   const message = (choices[0] as { message?: { content?: unknown; refusal?: unknown } }).message;
