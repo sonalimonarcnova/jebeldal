@@ -34,13 +34,19 @@
         {
           "cameraPermission": "Allow JebelDAL to capture incident photos.",
           "photosPermission": false,
-          "microphonePermission": false
+          "microphonePermission": "JebelDAL records your answers when you report an incident."
         }
       ],
       [
         "expo-local-authentication",
         {
           "faceIDPermission": "Confirm incident report submission on this device."
+        }
+      ],
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "JebelDAL records your answers when you report an incident."
         }
       ]
     ]
