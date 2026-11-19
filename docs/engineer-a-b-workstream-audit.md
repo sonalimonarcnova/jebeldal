@@ -29,6 +29,7 @@ The user confirmed that Supabase ref `paitemheimctgiqarekt` is the development t
 - Read-only schema checks confirmed the two profile columns, profile-completion RPC and trigger, answer-validation helper, and submit RPC.
 - The hosted `form_sets` and `form_definitions` tables were empty during pre-seed inspection. After reviewing the idempotent repository seed, it was applied to the confirmed development ref; read-only checks now show three active MVP form definitions and 38 interview nodes with 17 documented conditions in the versioned default form set.
 - `supabase test db --remote` did not execute the suites because the CLI requires a Docker image/runtime. A separate transaction-wrapped hosted smoke test passed for incomplete-profile draft rejection, completed-profile draft creation, and incomplete-profile submission rejection; its fixture changes were rolled back.
+- A second transaction-wrapped hosted smoke test used the seeded default form set and verified versioned text/boolean answer saves plus automatic GL/WC activation. It passed, and follow-up read-only checks confirmed all temporary organization/profile/incident rows were rolled back.
 - During history inspection, six comment-only entries were accidentally recorded through the migration-apply tool. They contained no schema/data SQL, were marked reverted immediately, and a subsequent CLI migration listing confirmed only the six repository migrations remain applied.
 - The hosted advisor scan also reported a mutable search path on `public.set_updated_at`, disabled leaked-password protection, and informational unindexed-FK/unused-index findings. These remain explicit follow-ups; unrelated Auth platform settings and index changes were not altered as part of the migration checkpoint.
 
@@ -48,6 +49,7 @@ The user confirmed that Supabase ref `paitemheimctgiqarekt` is the development t
 - A stale local narrative cache is no longer hidden when the server revision advances. Both copies are presented; the driver can keep the local copy for an explicit save against the current version or discard it in favor of the server copy. Submitted reports remain read-only.
 - Spanish is no longer offered as if supported. The profile UI and client write use English, consistent with the English-only MVP. Spanish remains deferred optional work.
 - The MVP renderer now validates and saves the supported pinned scalar field types and refreshes form activation/status after each successful save. Fields absent from the source definitions are not fabricated.
+- Validation passed: 17 mobile tests, mobile TypeScript check, Expo web export, and four static interview-graph seed tests. No end-to-end browser/device interaction with a hosted user session was performed.
 
 ### Still missing
 
