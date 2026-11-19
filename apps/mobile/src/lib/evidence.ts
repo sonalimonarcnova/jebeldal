@@ -1,4 +1,6 @@
-import { randomUUID } from 'expo-crypto';
+// Evidence upload through Eng B's RPCs (tables are read-only to drivers):
+//   read + check the local file → rpc create_incident_evidence (row + object path) → upload bytes to that path
+//   → verify stored size → rpc finalize_incident_evidence (server re-checks size + MIME). docs/voice-integration.md
 import { File } from 'expo-file-system';
 
 import { supabase } from './supabase';
@@ -7,17 +9,19 @@ export const EVIDENCE_BUCKET = 'incident-evidence';
 
 export type EvidenceMediaType = 'audio' | 'photo';
 
-const MEDIA: Record<EvidenceMediaType, { ext: string; contentType: string }> = {
-  audio: { ext: 'm4a', contentType: 'audio/mp4' },
-  photo: { ext: 'jpg', contentType: 'image/jpeg' },
+const CONTENT_TYPE: Record<EvidenceMediaType, string> = {
+  audio: 'audio/mp4', // m4a (MPEG-4 + AAC)
+  photo: 'image/jpeg',
 };
 
 export type EvidenceErrorCode =
   | 'NOT_SIGNED_IN'
-  | 'NO_PROFILE'
+  | 'NOT_ALLOWED'
+  | 'INCIDENT_NOT_DRAFT'
   | 'FILE_READ_FAILED'
   | 'ROW_FAILED'
-  | 'UPLOAD_FAILED';
+  | 'UPLOAD_FAILED'
+  | 'EVIDENCE_INVALID';
 
 /** Thrown by uploadEvidence. Pass `evidenceId` back in to retry without creating a second row. */
 export class EvidenceUploadError extends Error {
@@ -37,7 +41,7 @@ export type UploadEvidenceInput = {
   revisionId: string;
   uri: string;
   mediaType: EvidenceMediaType;
-  /** TODO(B1): stored once evidence.question_key exists (DB v2). Accepted now so callers don't change later. */
+  /** Stored as the evidence description (create_incident_evidence has no question_key column). */
   questionKey?: string;
   /** Reuse on retry (from EvidenceUploadError.evidenceId) so the same row and storage path are used. */
   evidenceId?: string;
@@ -58,7 +62,7 @@ class LocalFileError extends Error {
   }
 }
 
-/** Recorder/picker URIs are sometimes bare absolute paths; fetch() needs a file:// URL for those. */
+/** Recorder/picker URIs are sometimes bare absolute paths; File needs a file:// URL for those. */
 export function toFileUrl(uri: string): string {
   return uri.startsWith('/') ? `file://${uri}` : uri;
 }
@@ -71,10 +75,7 @@ export function hasExpectedSignature(bytes: Uint8Array, mediaType: EvidenceMedia
   return ascii(4) === 'ftyp' && !ascii(8).startsWith('3g');
 }
 
-/**
- * Reads the local recording/photo with expo-file-system (fetch() on file:// URIs is unreliable on devices and
- * can return an error body such as "File not found" instead of throwing).
- */
+/** Reads the local recording/photo with expo-file-system (fetch() on file:// URIs is unreliable on devices). */
 async function readLocalFile(uri: string, mediaType: EvidenceMediaType): Promise<Uint8Array> {
   const url = toFileUrl(uri);
   const scheme = url.split(':')[0] || 'none';
@@ -99,87 +100,93 @@ async function readLocalFile(uri: string, mediaType: EvidenceMediaType): Promise
   return bytes;
 }
 
-async function markFailed(evidenceId: string) {
-  await supabase.from('evidence').update({ upload_status: 'failed' }).eq('id', evidenceId);
+/** Eng B's RPCs raise errcode P0001 with the reason in `message`. */
+function rpcError(error: { code?: string; message?: string }, evidenceId: string | null): EvidenceUploadError {
+  const reason = error.code === 'P0001' ? error.message : undefined;
+  if (reason === 'AUTH_REQUIRED') return new EvidenceUploadError('NOT_SIGNED_IN', 'Sign in again to upload.', evidenceId, false);
+  if (reason === 'NOT_ALLOWED') {
+    return new EvidenceUploadError('NOT_ALLOWED', 'This report cannot take new evidence.', evidenceId, false);
+  }
+  if (reason === 'VALIDATION_FAILED') {
+    return new EvidenceUploadError('ROW_FAILED', 'The file is too large or not allowed.', evidenceId, false);
+  }
+  return new EvidenceUploadError('ROW_FAILED', 'Could not save the recording. Try again.', evidenceId, true);
 }
 
-/**
- * Evidence row first (pending) → upload to {org}/{revision}/{evidence}.{ext} → mark uploaded (docs/sprint-plan.md §3.4).
- * Idempotent per evidenceId: an existing row is reused, an already-uploaded one is returned as is.
- */
-export async function uploadEvidence(input: UploadEvidenceInput): Promise<UploadedEvidence> {
-  const { revisionId, uri, mediaType } = input;
-  const evidenceId = input.evidenceId ?? randomUUID();
-  const { ext, contentType } = MEDIA[mediaType];
-
-  const { data: userData } = await supabase.auth.getUser();
-  const user = userData.user;
-  if (!user) throw new EvidenceUploadError('NOT_SIGNED_IN', 'Sign in again to upload.', null, false);
-
-  const { data: profile, error: profileError } = await supabase
-    .from('profiles')
-    .select('organization_id')
-    .eq('user_id', user.id)
-    .maybeSingle<{ organization_id: string }>();
-  if (profileError) throw new EvidenceUploadError('NO_PROFILE', 'Could not load your profile.', null, true);
-  if (!profile) throw new EvidenceUploadError('NO_PROFILE', 'Your profile is not set up yet.', null, false);
-
-  const objectPath = `${profile.organization_id}/${revisionId}/${evidenceId}.${ext}`;
-
-  // 1. Row (reuse on retry).
-  const { data: existing, error: selectError } = await supabase
+/** Existing row for a retry (evidence is SELECT-only for drivers). */
+async function existingEvidence(evidenceId: string): Promise<EvidenceRow | null> {
+  const { data, error } = await supabase
     .from('evidence')
     .select('id, object_path, upload_status, size_bytes')
     .eq('id', evidenceId)
     .maybeSingle<EvidenceRow>();
-  if (selectError) throw new EvidenceUploadError('ROW_FAILED', 'Could not save the recording.', evidenceId, true);
-  if (existing?.upload_status === 'uploaded') {
-    return { evidenceId, objectPath: existing.object_path, sizeBytes: existing.size_bytes ?? 0 };
-  }
-  if (!existing) {
-    const { error: insertError } = await supabase.from('evidence').insert({
-      id: evidenceId,
-      organization_id: profile.organization_id,
-      incident_revision_id: revisionId,
-      object_path: objectPath,
-      media_type: mediaType,
-      upload_status: 'pending',
-      uploaded_by: user.id,
-      capture_time: new Date().toISOString(),
-    });
-    // 23505 = a previous attempt inserted the row but its response was lost; carry on with it.
-    if (insertError && insertError.code !== '23505') {
-      throw new EvidenceUploadError('ROW_FAILED', 'Could not save the recording.', evidenceId, true);
-    }
-  }
+  if (error) throw new EvidenceUploadError('ROW_FAILED', 'Could not save the recording. Try again.', evidenceId, true);
+  return data;
+}
 
-  // 2. File → storage. Never upload something that is not the real file (e.g. a "File not found" error body).
+/**
+ * Idempotent per evidenceId: on retry the existing row and path are reused, and an already-uploaded one is returned.
+ * A file read failure happens before any row exists, so it never leaves an orphan pending row.
+ */
+export async function uploadEvidence(input: UploadEvidenceInput): Promise<UploadedEvidence> {
+  const { revisionId, uri, mediaType } = input;
+  const contentType = CONTENT_TYPE[mediaType];
+
+  // 1. Read + check the local file (also gives the size create_incident_evidence needs).
   let body: Uint8Array;
   try {
     body = await readLocalFile(uri, mediaType);
   } catch (error) {
-    await markFailed(evidenceId);
     const detail = error instanceof LocalFileError ? ` (${error.detail})` : '';
-    throw new EvidenceUploadError('FILE_READ_FAILED', `Could not read the ${mediaType === 'audio' ? 'recording' : 'photo'} on this phone${detail}.`, evidenceId, false);
+    throw new EvidenceUploadError(
+      'FILE_READ_FAILED',
+      `Could not read the ${mediaType === 'audio' ? 'recording' : 'photo'} on this phone${detail}.`,
+      input.evidenceId ?? null,
+      false,
+    );
+  }
+  const sizeBytes = body.byteLength;
+
+  // 2. Row: reuse on retry, otherwise create via RPC (server builds the {org}/{revision}/{evidence} path).
+  let evidenceId: string;
+  let objectPath: string;
+  const prior = input.evidenceId ? await existingEvidence(input.evidenceId) : null;
+  if (prior) {
+    if (prior.upload_status === 'uploaded') return { evidenceId: prior.id, objectPath: prior.object_path, sizeBytes: prior.size_bytes ?? 0 };
+    if (prior.size_bytes !== null && prior.size_bytes !== sizeBytes) {
+      // finalize compares against the size given at creation, so a different file needs a new row.
+      throw new EvidenceUploadError('UPLOAD_FAILED', 'The recording changed since the first attempt. Record again.', prior.id, false);
+    }
+    evidenceId = prior.id;
+    objectPath = prior.object_path;
+  } else {
+    const { data, error } = await supabase.rpc('create_incident_evidence', {
+      p_incident_revision_id: revisionId,
+      p_media_type: mediaType,
+      p_size_bytes: sizeBytes,
+      p_description: input.questionKey ?? null,
+    });
+    if (error) throw rpcError(error, null);
+    const created = data as { evidence_id?: unknown; object_path?: unknown } | null;
+    if (typeof created?.evidence_id !== 'string' || typeof created.object_path !== 'string') {
+      throw new EvidenceUploadError('ROW_FAILED', 'Unexpected reply when saving the recording.', null, true);
+    }
+    evidenceId = created.evidence_id;
+    objectPath = created.object_path;
   }
 
-  // Send an exact ArrayBuffer (not a view that may sit inside a larger buffer) so RN's networking layer sends
-  // precisely these bytes.
-  const sizeBytes = body.byteLength;
+  // 3. Upload an exact ArrayBuffer (not a view inside a larger buffer) to the server-chosen path.
   const payload = body.buffer.slice(body.byteOffset, body.byteOffset + sizeBytes) as ArrayBuffer;
   const { error: uploadError } = await supabase.storage
     .from(EVIDENCE_BUCKET)
     .upload(objectPath, payload, { contentType, upsert: true });
   if (uploadError) {
-    await markFailed(evidenceId);
     throw new EvidenceUploadError('UPLOAD_FAILED', 'Upload failed. Check your connection and try again.', evidenceId, true);
   }
 
-  // Verify what Storage holds is what we read. A mismatch means the bytes were altered in transit.
-  // If the info call itself fails we do not block: the upload already succeeded and the server sniffs the bytes.
+  // 4. Verify what Storage holds is what we read (finalize checks this too; this gives a clearer error).
   const { data: stored } = await supabase.storage.from(EVIDENCE_BUCKET).info(objectPath);
   if (stored && typeof stored.size === 'number' && stored.size !== sizeBytes) {
-    await markFailed(evidenceId);
     throw new EvidenceUploadError(
       'UPLOAD_FAILED',
       `Upload was corrupted (stored ${stored.size} bytes, expected ${sizeBytes}). Try again.`,
@@ -188,13 +195,17 @@ export async function uploadEvidence(input: UploadEvidenceInput): Promise<Upload
     );
   }
 
-  // 3. Mark uploaded.
-  const { error: updateError } = await supabase
-    .from('evidence')
-    .update({ upload_status: 'uploaded', size_bytes: sizeBytes > 0 ? sizeBytes : null })
-    .eq('id', evidenceId);
-  if (updateError) {
-    throw new EvidenceUploadError('ROW_FAILED', 'Upload finished but could not be confirmed. Try again.', evidenceId, true);
+  // 5. Finalize: the server re-checks size + MIME and marks the row uploaded (or failed).
+  const { data: finalized, error: finalizeError } = await supabase.rpc('finalize_incident_evidence', { p_evidence_id: evidenceId });
+  if (finalizeError) throw rpcError(finalizeError, evidenceId);
+  const result = finalized as { upload_status?: unknown; code?: unknown } | null;
+  if (result?.upload_status !== 'uploaded') {
+    throw new EvidenceUploadError(
+      'EVIDENCE_INVALID',
+      'The server rejected the file (size or type mismatch). Try again.',
+      evidenceId,
+      true,
+    );
   }
 
   return { evidenceId, objectPath, sizeBytes };

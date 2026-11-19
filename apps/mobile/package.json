@@ -41,7 +41,7 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/phase1.test.mjs",
+    "test": "tsx --test tests/phase1.test.mjs tests/voice.test.mjs",
     "supabase:local:env": "echo \"Run from repo root: npx supabase status -o env --override-name api.url=EXPO_PUBLIC_SUPABASE_URL --override-name api.anon_key=EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY\""
   },
   "private": true

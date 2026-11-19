@@ -6,13 +6,13 @@ import { useCallback, useRef, useState } from 'react';
 import { ScrollView, StyleSheet, View } from 'react-native';
 import { Button, Card, Divider, HelperText, Text, TextInput, TouchableRipple, useTheme } from 'react-native-paper';
 
-import { createDraft, processTurn, type ProcessTurnResponse, type TurnProposal } from '../../lib/api';
+import { createDraft, processTurn, saveAcceptedProposals, type ProcessTurnResponse, type TurnProposal } from '../../lib/api';
 import { EvidenceUploadError, uploadEvidence } from '../../lib/evidence';
 import { useRecorder } from './useRecorder';
 
 const QUESTION_KEY = 'what_happened';
 /** Bump on every change you need to see on the phone; if the screen shows an older value, the bundle is stale. */
-const DEV_BUILD = 'voice-dev #5 · file-system read + recorder checks';
+const DEV_BUILD = 'voice-dev #6 · Eng B backend (RPC turns, form catalog, save via RPC)';
 
 type PendingTurn =
   | { kind: 'audio'; clientTurnId: string; uri: string; evidenceId?: string; uploaded: boolean }
@@ -22,7 +22,8 @@ type TurnOutcome = { response: ProcessTurnResponse; totalMs: number; uploadMs: n
 type TurnFailure = { message: string; code: string; retryable: boolean };
 
 const formatClock = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-const formatValue = (v: TurnProposal['value']) => (Array.isArray(v) ? v.join(', ') : v);
+const formatValue = (v: TurnProposal['value']) => (Array.isArray(v) ? v.join(', ') : typeof v === 'boolean' ? (v ? 'yes' : 'no') : v);
+const fieldId = (p: { form_key: string; field_key: string }) => `${p.form_key}.${p.field_key}`;
 
 export function VoiceDevScreen() {
   const theme = useTheme();
@@ -220,15 +221,33 @@ export function VoiceDevScreen() {
         </Card>
       ) : null}
 
-      {outcome ? <Result outcome={outcome} /> : null}
+      {outcome && revisionId ? <Result outcome={outcome} revisionId={revisionId} /> : null}
     </ScrollView>
   );
 }
 
-function Result({ outcome }: { outcome: TurnOutcome }) {
+function Result({ outcome, revisionId }: { outcome: TurnOutcome; revisionId: string }) {
   const theme = useTheme();
   const { response, totalMs, uploadMs } = outcome;
   const muted = { color: theme.colors.onSurfaceVariant };
+  const [saving, setSaving] = useState(false);
+  const [saveNote, setSaveNote] = useState<{ ok: boolean; text: string } | null>(null);
+
+  // Dev shortcut for "driver confirms the applied answers". The real interview confirms per field (D-25).
+  const onSaveApplied = async () => {
+    setSaving(true);
+    setSaveNote(null);
+    const result = await saveAcceptedProposals(revisionId, response.applied);
+    setSaving(false);
+    setSaveNote(
+      result.ok
+        ? { ok: true, text: `Saved ${result.data.saved.length} answers · revision v${result.data.version}` }
+        : {
+            ok: false,
+            text: `${result.code}${result.failed ? ` at ${fieldId(result.failed)}` : ''} · ${result.message} (saved ${result.saved.length})`,
+          },
+    );
+  };
   return (
     <Card mode="outlined">
       <Card.Content style={styles.cardContent}>
@@ -246,11 +265,17 @@ function Result({ outcome }: { outcome: TurnOutcome }) {
         <Divider />
         <Text variant="titleSmall">Applied ({response.applied.length})</Text>
         {response.applied.map((p) => (
-          <Text key={p.key} variant="bodyMedium">
-            {p.key}: {formatValue(p.value)}
+          <Text key={fieldId(p)} variant="bodyMedium">
+            {fieldId(p)}: {formatValue(p.value)}
             <Text variant="bodySmall" style={muted}>{`  ${p.confidence.toFixed(2)} · “${p.evidence_quote.slice(0, 60)}”`}</Text>
           </Text>
         ))}
+        {response.applied.length > 0 ? (
+          <Button mode="outlined" onPress={onSaveApplied} loading={saving} disabled={saving} contentStyle={styles.buttonContent}>
+            Save applied answers
+          </Button>
+        ) : null}
+        {saveNote ? <HelperText type={saveNote.ok ? 'info' : 'error'}>{saveNote.text}</HelperText> : null}
         <Text variant="titleSmall">Suggested ({response.suggested.length})</Text>
         {response.suggested.length === 0 ? (
           <Text variant="bodySmall" style={muted}>
@@ -258,16 +283,11 @@ function Result({ outcome }: { outcome: TurnOutcome }) {
           </Text>
         ) : (
           response.suggested.map((p) => (
-            <Text key={p.key} variant="bodyMedium">
-              {p.key}: {formatValue(p.value)} ({p.confidence.toFixed(2)})
+            <Text key={fieldId(p)} variant="bodyMedium">
+              {fieldId(p)}: {formatValue(p.value)} ({p.confidence.toFixed(2)})
             </Text>
           ))
         )}
-        {response.kept_existing.length > 0 ? (
-          <Text variant="bodySmall" style={muted}>
-            Kept driver answers: {response.kept_existing.join(', ')}
-          </Text>
-        ) : null}
         <Text variant="bodySmall" style={muted} selectable>
           turn {response.turn_id}
         </Text>

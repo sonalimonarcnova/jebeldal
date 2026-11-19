@@ -64,6 +64,6 @@ $second.body | ConvertFrom-Json | ConvertTo-Json -Depth 10
 
 $same = ($first.body | ConvertFrom-Json | ConvertTo-Json -Depth 10 -Compress) -eq ($second.body | ConvertFrom-Json | ConvertTo-Json -Depth 10 -Compress)
 Write-Host "`nIdentical responses: $same"
-$applied = (($first.body | ConvertFrom-Json).applied | ForEach-Object { $_.key }) -join ', '
+$applied = (($first.body | ConvertFrom-Json).applied | ForEach-Object { "$($_.form_key).$($_.field_key)" }) -join ', '
 Write-Host "Applied keys: $applied"
 if (-not $same -or $first.status -ne 200) { exit 1 }

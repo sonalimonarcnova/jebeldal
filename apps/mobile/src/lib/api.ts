@@ -1,14 +1,17 @@
 import { FunctionsFetchError, FunctionsHttpError, FunctionsRelayError } from '@supabase/supabase-js';
 import { z } from 'zod';
 
+import { saveAcceptedProposalsWith, type SaveClient, type SaveProposalsResult } from './saveProposals';
 import { supabase } from './supabase';
 
 // ---------------------------------------------------------------------------
-// Contracts — docs/sprint-plan.md §3.3 (process-incident-turn) + "mode" + "kept_existing"
+// Contracts — docs/voice-integration.md (process-incident-turn on Eng B's backend)
 // ---------------------------------------------------------------------------
 export const proposalSchema = z.object({
-  key: z.string(),
-  value: z.union([z.string(), z.array(z.string())]),
+  form_key: z.string().min(1),
+  field_key: z.string().min(1),
+  /** text → string, enum → string, multi_enum → string[], boolean → true/false */
+  value: z.union([z.string(), z.array(z.string()), z.boolean()]),
   confidence: z.number().min(0).max(1),
   evidence_quote: z.string(),
 });
@@ -18,11 +21,12 @@ export const processTurnResponseSchema = z.object({
   turn_id: z.string(),
   status: z.literal('completed'),
   transcript: z.string(),
+  /** confidence ≥ 0.8 and explicitly stated — safe to save after the driver confirms */
   applied: z.array(proposalSchema),
+  /** lower confidence or inferred — pre-select with a "from your story" badge, never save silently */
   suggested: z.array(proposalSchema),
   latency_ms: z.object({ stt: z.number(), llm: z.number() }),
   mode: z.enum(['mock', 'groq', 'xai', 'live']),
-  kept_existing: z.array(z.string()).default([]),
 });
 export type ProcessTurnResponse = z.infer<typeof processTurnResponseSchema>;
 
@@ -87,4 +91,19 @@ export async function createDraft(): Promise<ApiResult<{ revisionId: string }>> 
   }
   const parsed = z.string().uuid().safeParse(data);
   return parsed.success ? { ok: true, data: { revisionId: parsed.data } } : BAD_RESPONSE;
+}
+
+// ---------------------------------------------------------------------------
+// Saving accepted proposals — logic in ./saveProposals.ts (client-agnostic, testable in Node)
+// ---------------------------------------------------------------------------
+export { mapRpcError } from './saveProposals';
+export type { SaveErrorCode, SavedField, SaveProposalsResult } from './saveProposals';
+
+/**
+ * Saves the driver-accepted proposals one by one with rpc save_incident_answer (source 'driver_confirmed'),
+ * reading the revision version first and threading each returned version into the next call.
+ */
+export function saveAcceptedProposals(revisionId: string, proposals: TurnProposal[]): Promise<SaveProposalsResult> {
+  // supabase-js's builder types are richer than SaveClient; the shape used is the same.
+  return saveAcceptedProposalsWith(supabase as unknown as SaveClient, revisionId, proposals);
 }

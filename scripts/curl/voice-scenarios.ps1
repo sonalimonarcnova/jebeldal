@@ -29,7 +29,7 @@ foreach ($name in $scenarios.Keys) {
   foreach ($a in $j.applied) {
     $v = if ($a.value -is [array]) { $a.value -join ', ' } else { "$($a.value)" }
     if ($a.key -eq 'what_happened') { $v = '(full transcript)' }
-    "   applied   {0,-17} {1,-45} {2:0.00}  ""{3}""" -f $a.key, $v, $a.confidence, $a.evidence_quote
+    "   applied   {0,-17} {1,-45} {2:0.00}  ""{3}""" -f "$($a.form_key).$($a.field_key)", $v, $a.confidence, $a.evidence_quote
   }
   foreach ($s in $j.suggested) {
     $v = if ($s.value -is [array]) { $s.value -join ', ' } else { "$($s.value)" }

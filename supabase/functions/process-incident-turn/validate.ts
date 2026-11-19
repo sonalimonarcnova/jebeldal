@@ -2,11 +2,22 @@
 import type { CatalogEntry } from './catalog.ts';
 
 export const APPLY_THRESHOLD = 0.8;
+/** Values the model marks as inferred (stated: false) are capped here, which keeps them in `suggested`. */
+export const INFERRED_MAX_CONFIDENCE = 0.6;
 
-/** A validated proposal. `value` is a string for text/enum keys and a string[] for enum_list keys. */
-export type Proposal = {
+/** Internal: a validated proposal on a composite catalog key, value as the model's string form. */
+type Proposal = {
   key: string;
   value: string | string[];
+  confidence: number;
+  evidence_quote: string;
+};
+
+/** Contract shape (docs/voice-integration.md). Booleans are real JSON booleans, ready for save_incident_answer. */
+export type FieldProposal = {
+  form_key: string;
+  field_key: string;
+  value: string | string[] | boolean;
   confidence: number;
   evidence_quote: string;
 };
@@ -21,10 +32,10 @@ export type RejectReason =
 export type Rejected = { key: string | null; reason: RejectReason; proposal: unknown };
 
 export type ValidationResult = {
-  /** confidence ≥ APPLY_THRESHOLD, one entry per key */
-  applied: Proposal[];
-  /** valid but below threshold, one entry per key; enum/text keys already applied are dropped */
-  suggested: Proposal[];
+  /** confidence ≥ APPLY_THRESHOLD, one entry per (form_key, field_key) */
+  applied: FieldProposal[];
+  /** valid but below threshold, one entry per field; enum/text fields already applied are dropped */
+  suggested: FieldProposal[];
   rejected: Rejected[];
 };
 
@@ -72,10 +83,13 @@ function normaliseValue(entry: CatalogEntry, value: unknown): string | string[] 
   if (entry.extractType === 'text') {
     if (typeof value !== 'string') return null;
     const trimmed = value.trim();
-    return trimmed.length > 0 ? trimmed : null;
+    if (trimmed.length === 0) return null;
+    return entry.maxLength !== undefined && trimmed.length > entry.maxLength ? null : trimmed;
   }
 
   const options = entry.options ?? [];
+  // Boolean fields are offered as "true"/"false"; accept a real JSON boolean too.
+  if (entry.valueKind === 'boolean' && typeof value === 'boolean') value = String(value);
   if (entry.extractType === 'enum') {
     // A one-element array is accepted for single-choice keys (the LLM schema allows string | string[]).
     const single = Array.isArray(value) && value.length === 1 ? value[0] : value;
@@ -111,10 +125,12 @@ function validateOne(
   const value = normaliseValue(entry, raw.value);
   if (value === null) return { key, reason: 'invalid_value', proposal: raw };
 
-  const confidence = raw.confidence;
-  if (typeof confidence !== 'number' || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+  const rawConfidence = raw.confidence;
+  if (typeof rawConfidence !== 'number' || !Number.isFinite(rawConfidence) || rawConfidence < 0 || rawConfidence > 1) {
     return { key, reason: 'invalid_confidence', proposal: raw };
   }
+  // Anything not explicitly stated by the driver can only be a suggestion.
+  const confidence = raw.stated === false ? Math.min(rawConfidence, INFERRED_MAX_CONFIDENCE) : rawConfidence;
 
   const quote = typeof raw.evidence_quote === 'string' ? raw.evidence_quote.trim() : '';
   if (!quoteInTranscript(quote, normalisedTranscript)) {
@@ -194,5 +210,16 @@ export function validateProposals(
     }
   }
 
-  return { applied, suggested, rejected };
+  const toField = (p: Proposal): FieldProposal => {
+    const entry = byKey.get(p.key);
+    const value = entry?.valueKind === 'boolean' && typeof p.value === 'string' ? p.value === 'true' : p.value;
+    return {
+      form_key: entry?.formKey ?? '',
+      field_key: entry?.fieldKey ?? p.key,
+      value,
+      confidence: p.confidence,
+      evidence_quote: p.evidence_quote,
+    };
+  };
+  return { applied: applied.map(toField), suggested: suggested.map(toField), rejected };
 }

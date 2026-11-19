@@ -53,4 +53,4 @@ printf '%s' "$SECOND" | pretty
 echo
 if [[ "$FIRST" == "$SECOND" ]]; then echo "Identical responses: true"; else echo "Identical responses: false"; exit 1; fi
 printf 'Applied keys: '
-printf '%s' "$FIRST" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).applied.map(a=>a.key).join(", ")))'
+printf '%s' "$FIRST" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).applied.map(a=>a.form_key+"."+a.field_key).join(", ")))'

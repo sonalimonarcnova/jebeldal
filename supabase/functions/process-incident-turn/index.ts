@@ -1,15 +1,19 @@
+// process-incident-turn — transcribe (audio) + extract proposals for the revision's triggered forms.
+// Persistence goes ONLY through Eng B's RPCs with the caller's JWT:
+//   begin_incident_turn (start + idempotency) → record_incident_turn_result (processing / completed / failed).
+// This function never writes answers. The app saves accepted proposals with save_incident_answer
+// (apps/mobile/src/lib/api.ts saveAcceptedProposals). See docs/voice-integration.md.
 import { createClient, type SupabaseClient } from 'npm:@supabase/supabase-js@2.49.4';
 import { corsHeaders } from '../_shared/cors.ts';
 import { incidentTurnSchema } from '../_shared/schema.ts';
-import { getCatalog, type CatalogEntry } from './catalog.ts';
 import { MIN_AUDIO_BYTES, sniffAudio } from './audio.ts';
+import type { CatalogEntry } from './catalog.ts';
+import { buildFormCatalog, findQuestion, type FormDefinitionRow, type TriggeredForm } from './form_catalog.ts';
 import { getProviders, ProviderError, type ProviderMode, type Providers } from './providers.ts';
-import { validateProposals, type Proposal, type ValidationResult } from './validate.ts';
+import { validateProposals, type FieldProposal, type ValidationResult } from './validate.ts';
 
 const FN = 'process-incident-turn';
-const FORM_KEY = 'interview';
 const BUCKET = 'incident-evidence';
-const PROTECTED_SOURCES = new Set(['tap', 'typed', 'edited']);
 const STALE_PROCESSING_MS = 60_000;
 
 type ErrorCode = 'PROVIDER_UNAVAILABLE' | 'VALIDATION_FAILED' | 'NOT_ALLOWED' | 'INCIDENT_NOT_DRAFT';
@@ -18,34 +22,32 @@ type TurnResponse = {
   turn_id: string;
   status: 'completed';
   transcript: string;
-  applied: Proposal[];
-  suggested: Proposal[];
+  applied: FieldProposal[];
+  suggested: FieldProposal[];
   latency_ms: { stt: number; llm: number };
   mode: ProviderMode;
-  /** keys extracted from this turn but not written because the driver already set them (tap/typed/edited) */
-  kept_existing: string[];
 };
 
-/** Shape stored in conversation_turns.extraction_proposals. */
+/** Stored via record_incident_turn_result into conversation_turns.extraction_proposals. */
 type StoredExtraction = {
-  version: 1;
+  version: 2;
   question_key: string;
   mode: ProviderMode;
+  forms: string[];
+  fallback_forms: string[];
   rejected: ValidationResult['rejected'];
-  /** applied proposals not written because the driver already answered via tap/typed/edited */
-  kept_existing: string[];
-  // TODO(B1): incident_answers has no evidence_quote column yet; evidence quotes live only here
-  // (inside `response.applied` / `response.suggested`) until the DB v2 migration adds it.
   response: TurnResponse;
   /** Exact JSON text of the first response; jsonb reorders keys, so replays send this string verbatim. */
   response_body: string;
 };
 
-type TurnRow = {
-  id: string;
+/** Shape returned by begin_incident_turn / record_incident_turn_result. */
+type TurnState = {
+  turn_id: string;
   status: 'pending' | 'processing' | 'completed' | 'failed';
-  extraction_proposals: StoredExtraction | null;
-  updated_at: string;
+  transcript: string | null;
+  proposals: StoredExtraction | null;
+  error_code: string | null;
 };
 
 class HttpError extends Error {
@@ -71,8 +73,7 @@ const replay = (stored: StoredExtraction) =>
     headers: { ...corsHeaders, 'Content-Type': 'application/json' },
   });
 
-const errorResponse = (e: HttpError) =>
-  json({ code: e.code, message: e.message, retryable: e.retryable }, e.status);
+const errorResponse = (e: HttpError) => json({ code: e.code, message: e.message, retryable: e.retryable }, e.status);
 
 // Logs ids, status, latency and mode only — never transcripts, audio, payloads or keys.
 function log(fields: Record<string, unknown>) {
@@ -89,62 +90,103 @@ function dbFailure(stage: string): HttpError {
   return new HttpError(503, 'PROVIDER_UNAVAILABLE', 'Something went wrong saving your answer. Please try again.', true, `db_${stage}`);
 }
 
+/** Maps Eng B's RPC exceptions (errcode P0001, reason in `message`) to the §3.3 error contract. */
+function rpcFailure(stage: string, error: { code?: string; message?: string }): HttpError {
+  const reason = error.code === 'P0001' ? (error.message ?? '') : '';
+  switch (reason) {
+    case 'AUTH_REQUIRED':
+      return new HttpError(401, 'NOT_ALLOWED', 'Sign in again to continue.', false, 'auth_required');
+    case 'NOT_ALLOWED':
+      return new HttpError(403, 'NOT_ALLOWED', 'This report was not found.', false, 'not_allowed');
+    case 'INCIDENT_NOT_DRAFT':
+      return new HttpError(409, 'INCIDENT_NOT_DRAFT', 'This report was already submitted.', false, 'incident_not_draft');
+    case 'TURN_ID_REUSED':
+      return new HttpError(400, 'VALIDATION_FAILED', 'This answer id was already used for different input.', false, 'turn_id_reused');
+    case 'VALIDATION_FAILED':
+      return new HttpError(400, 'VALIDATION_FAILED', 'The answer could not be accepted.', false, `${stage}_validation_failed`);
+    default:
+      return dbFailure(stage);
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Turn bookkeeping
+// Catalog from the revision's triggered forms
 // ---------------------------------------------------------------------------
-async function findTurn(db: SupabaseClient, revisionId: string, clientTurnId: string): Promise<TurnRow | null> {
-  const { data, error } = await db
+async function loadCatalog(db: SupabaseClient, revisionId: string) {
+  const { data: forms, error: formsError } = await db
+    .from('incident_revision_forms')
+    .select('form_key, form_version')
+    .eq('incident_revision_id', revisionId)
+    .eq('activation_status', 'triggered');
+  if (formsError) throw dbFailure('revision_forms_select');
+  const triggered = (forms ?? []) as TriggeredForm[];
+  if (triggered.length === 0) {
+    throw new HttpError(409, 'VALIDATION_FAILED', 'This report has no active forms yet.', false, 'no_triggered_forms');
+  }
+
+  const { data: defs, error: defsError } = await db
+    .from('form_definitions')
+    .select('form_key, version, definition')
+    .in('form_key', triggered.map((f) => f.form_key));
+  if (defsError) throw dbFailure('form_definitions_select');
+
+  const built = buildFormCatalog(triggered, (defs ?? []) as FormDefinitionRow[]);
+  if (built.fallbackForms.length > 0 || built.skipped.length > 0) {
+    log({
+      event: 'catalog_degraded',
+      revision_id: revisionId,
+      fallback_forms: built.fallbackForms, // triggered forms with no usable fields → stub catalog used
+      skipped_fields: built.skipped.map((s) => `${s.form_key}.${s.field_key}:${s.type}`),
+    });
+  }
+  return { ...built, forms: triggered.map((f) => f.form_key) };
+}
+
+// ---------------------------------------------------------------------------
+// Turn bookkeeping via RPC
+// ---------------------------------------------------------------------------
+async function beginTurn(
+  db: SupabaseClient,
+  input: { incident_revision_id: string; client_turn_id: string; text?: string; audio_evidence_id?: string },
+  language: string,
+): Promise<TurnState> {
+  const { data, error } = await db.rpc('begin_incident_turn', {
+    p_incident_revision_id: input.incident_revision_id,
+    p_client_turn_id: input.client_turn_id,
+    p_text: input.text ?? null,
+    p_audio_evidence_id: input.audio_evidence_id ?? null,
+    p_language: language,
+  });
+  if (error) throw rpcFailure('begin_turn', error);
+  return data as TurnState;
+}
+
+async function recordTurn(
+  db: SupabaseClient,
+  revisionId: string,
+  turnId: string,
+  patch: { status: 'processing' | 'completed' | 'failed'; transcript?: string; proposals?: StoredExtraction; errorCode?: string },
+): Promise<void> {
+  const { error } = await db.rpc('record_incident_turn_result', {
+    p_incident_revision_id: revisionId,
+    p_turn_id: turnId,
+    p_status: patch.status,
+    p_transcript: patch.transcript ?? null,
+    p_proposals: patch.proposals ?? null,
+    p_error_code: patch.errorCode ?? null,
+  });
+  if (error) throw rpcFailure('record_turn', error);
+}
+
+/** Read-only lookup (conversation_turns is SELECT-only for drivers). */
+async function readTurn(db: SupabaseClient, revisionId: string, clientTurnId: string) {
+  const { data } = await db
     .from('conversation_turns')
     .select('id, status, extraction_proposals, updated_at')
     .eq('incident_revision_id', revisionId)
     .eq('client_turn_id', clientTurnId)
     .maybeSingle();
-  if (error) throw dbFailure('turn_select');
-  return data as TurnRow | null;
-}
-
-/** Creates the turn row (status processing), or returns the existing row for this client_turn_id. */
-async function claimTurn(
-  db: SupabaseClient,
-  revisionId: string,
-  clientTurnId: string,
-  inputKind: 'audio' | 'text',
-): Promise<{ turn: TurnRow; created: boolean }> {
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const existing = await findTurn(db, revisionId, clientTurnId);
-    if (existing) return { turn: existing, created: false };
-
-    const { data: last, error: seqError } = await db
-      .from('conversation_turns')
-      .select('sequence')
-      .eq('incident_revision_id', revisionId)
-      .order('sequence', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (seqError) throw dbFailure('turn_sequence');
-
-    const { data, error } = await db
-      .from('conversation_turns')
-      .insert({
-        incident_revision_id: revisionId,
-        client_turn_id: clientTurnId,
-        sequence: ((last as { sequence: number } | null)?.sequence ?? 0) + 1,
-        speaker: 'driver',
-        input_kind: inputKind,
-        status: 'processing',
-      })
-      .select('id, status, extraction_proposals, updated_at')
-      .single();
-    if (!error) return { turn: data as TurnRow, created: true };
-    if (error.code !== '23505') throw dbFailure('turn_insert');
-    // Unique violation: either a concurrent request with the same client_turn_id or a sequence race. Loop.
-  }
-  throw dbFailure('turn_claim');
-}
-
-async function updateTurn(db: SupabaseClient, turnId: string, patch: Record<string, unknown>) {
-  const { error } = await db.from('conversation_turns').update(patch).eq('id', turnId);
-  if (error) throw dbFailure('turn_update');
+  return data as { id: string; status: string; extraction_proposals: StoredExtraction | null; updated_at: string } | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -156,8 +198,8 @@ type LogContext = { revision_id: string; turn_id: string };
 const RERECORD = 'The recording did not save properly. Please record your answer again or type it.';
 
 /**
- * Evidence row → storage download → content sniffing. The STT filename/type come from the real bytes, not the
- * object path, and anything that is not supported audio is rejected here instead of failing at the provider.
+ * Evidence row (read-only) → storage download → content sniffing. The STT filename/type come from the real bytes,
+ * not the object path (create_incident_evidence paths have no extension).
  */
 async function loadAudio(db: SupabaseClient, revisionId: string, evidenceId: string, ctx: LogContext): Promise<LoadedAudio> {
   const { data, error } = await db
@@ -196,13 +238,10 @@ async function loadAudio(db: SupabaseClient, revisionId: string, evidenceId: str
     status: 'ok',
     bytes: bytes.length,
     content_type: stored.type || null,
-    path_ext: evidence.object_path.split('.').pop() ?? null,
     sniffed_format: sniffed.format,
   });
 
-  if (bytes.length < MIN_AUDIO_BYTES) {
-    throw new HttpError(400, 'VALIDATION_FAILED', RERECORD, false, 'audio_too_small');
-  }
+  if (bytes.length < MIN_AUDIO_BYTES) throw new HttpError(400, 'VALIDATION_FAILED', RERECORD, false, 'audio_too_small');
   if (sniffed.format === 'unknown') throw new HttpError(400, 'VALIDATION_FAILED', RERECORD, false, 'audio_not_audio');
   if (!sniffed.sttSupported) {
     throw new HttpError(400, 'VALIDATION_FAILED', RERECORD, false, `audio_unsupported_${sniffed.format}`);
@@ -210,60 +249,24 @@ async function loadAudio(db: SupabaseClient, revisionId: string, evidenceId: str
   return { blob: new Blob([bytes], { type: sniffed.mime }), filename: `audio.${sniffed.ext}` };
 }
 
-// ---------------------------------------------------------------------------
-// Answers
-// ---------------------------------------------------------------------------
-/** Writes applied proposals as confirmed voice answers. Returns keys skipped because the driver set them. */
-async function writeAnswers(
-  db: SupabaseClient,
-  revisionId: string,
-  userId: string,
-  turnId: string,
-  applied: Proposal[],
-): Promise<string[]> {
-  if (applied.length === 0) return [];
-
-  // Select-then-write: the current unique key includes the nullable group_instance_id, so PostgREST
-  // on_conflict upserts cannot target it. TODO(B1): switch to upsert once it is UNIQUE NULLS NOT DISTINCT.
-  const { data, error } = await db
-    .from('incident_answers')
-    .select('id, field_key, source')
-    .eq('incident_revision_id', revisionId)
-    .eq('form_key', FORM_KEY)
-    .is('group_instance_id', null)
-    .in('field_key', applied.map((p) => p.key));
-  if (error) throw dbFailure('answers_select');
-  const existing = new Map(
-    ((data ?? []) as { id: string; field_key: string; source: string }[]).map((row) => [row.field_key, row]),
-  );
-
-  const keptExisting: string[] = [];
-  const inserts: Record<string, unknown>[] = [];
-  for (const p of applied) {
-    const row = {
-      value: p.value,
-      answer_state: 'confirmed',
-      source: 'voice',
-      confidence: p.confidence,
-      transcript_turn_id: turnId,
-      updated_by: userId,
-      updated_at: new Date().toISOString(),
-    };
-    const current = existing.get(p.key);
-    if (current && PROTECTED_SOURCES.has(current.source)) {
-      keptExisting.push(p.key);
-    } else if (current) {
-      const { error: updateError } = await db.from('incident_answers').update(row).eq('id', current.id);
-      if (updateError) throw dbFailure('answers_update');
-    } else {
-      inserts.push({ ...row, incident_revision_id: revisionId, form_key: FORM_KEY, field_key: p.key });
-    }
+/** The driver's own words for the current question (narrative always; other text questions if nothing applied). */
+function withOwnWords(result: ValidationResult, question: CatalogEntry, transcript: string): ValidationResult {
+  const isQuestion = (p: FieldProposal) => p.form_key === question.formKey && p.field_key === question.fieldKey;
+  const ownWords: FieldProposal = {
+    form_key: question.formKey ?? '',
+    field_key: question.fieldKey ?? question.key,
+    value: transcript,
+    confidence: 1,
+    evidence_quote: transcript,
+  };
+  const fits = question.maxLength === undefined || transcript.length <= question.maxLength;
+  if (question.narrative && fits) {
+    return { ...result, applied: [...result.applied.filter((p) => !isQuestion(p)), ownWords], suggested: result.suggested.filter((p) => !isQuestion(p)) };
   }
-  if (inserts.length > 0) {
-    const { error: insertError } = await db.from('incident_answers').insert(inserts);
-    if (insertError) throw dbFailure('answers_insert');
+  if (question.extractType === 'text' && fits && !result.applied.some(isQuestion)) {
+    return { ...result, applied: [...result.applied, ownWords], suggested: result.suggested.filter((p) => !isQuestion(p)) };
   }
-  return keptExisting;
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -282,15 +285,14 @@ async function handle(req: Request): Promise<Response> {
   }
   const parsed = incidentTurnSchema.safeParse(body);
   if (!parsed.success) {
-    throw new HttpError(400, 'VALIDATION_FAILED', parsed.error.issues
-      .map((i) => (i.path.length ? `${i.path.join('.')}: ${i.message}` : i.message))
-      .join('; '), false);
+    throw new HttpError(
+      400,
+      'VALIDATION_FAILED',
+      parsed.error.issues.map((i) => (i.path.length ? `${i.path.join('.')}: ${i.message}` : i.message)).join('; '),
+      false,
+    );
   }
   const input = parsed.data;
-
-  const catalog: CatalogEntry[] = getCatalog();
-  const question = catalog.find((q) => q.key === input.question_key);
-  if (!question) throw new HttpError(400, 'VALIDATION_FAILED', 'Unknown question_key.', false);
 
   const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
   const anonKey = Deno.env.get('SUPABASE_ANON_KEY') ?? Deno.env.get('SUPABASE_PUBLISHABLE_KEY') ?? '';
@@ -301,27 +303,28 @@ async function handle(req: Request): Promise<Response> {
 
   const { data: userData, error: userError } = await db.auth.getUser(jwt);
   if (userError || !userData.user) throw new HttpError(401, 'NOT_ALLOWED', 'Sign in again to continue.', false);
-  const userId = userData.user.id;
 
   // RLS only returns revisions of incidents the caller reported, so "not found" = not allowed.
-  const { data: revision, error: revisionError } = await db
+  const { data: revisionRow, error: revisionError } = await db
     .from('incident_revisions')
     .select('id, status, language')
     .eq('id', input.incident_revision_id)
     .maybeSingle();
   if (revisionError) throw dbFailure('revision_select');
-  if (!revision) throw new HttpError(403, 'NOT_ALLOWED', 'This report was not found.', false);
+  if (!revisionRow) throw new HttpError(403, 'NOT_ALLOWED', 'This report was not found.', false);
+  const revision = revisionRow as { id: string; status: string; language: string | null };
 
-  // Idempotency: a completed turn returns its stored response, even if the revision has since been submitted.
-  const prior = await findTurn(db, input.incident_revision_id, input.client_turn_id);
-  if (prior?.status === 'completed' && prior.extraction_proposals?.response) {
-    log({ event: 'turn_replayed', revision_id: input.incident_revision_id, turn_id: prior.id, status: 'completed' });
-    return replay(prior.extraction_proposals);
-  }
-
-  if ((revision as { status: string }).status !== 'draft') {
+  // A completed turn replays its stored response even after submission (begin_incident_turn refuses non-drafts).
+  if (revision.status !== 'draft') {
+    const done = await readTurn(db, revision.id, input.client_turn_id);
+    if (done?.status === 'completed' && done.extraction_proposals?.response) return replay(done.extraction_proposals);
     throw new HttpError(409, 'INCIDENT_NOT_DRAFT', 'This report was already submitted.', false);
   }
+
+  // Catalog + question first, so an invalid question_key never leaves a pending turn behind.
+  const { catalog, forms, fallbackForms } = await loadCatalog(db, revision.id);
+  const question = findQuestion(catalog, input.question_key);
+  if (!question) throw new HttpError(400, 'VALIDATION_FAILED', 'Unknown question_key for this report.', false, 'unknown_question');
 
   let providers: Providers;
   try {
@@ -331,87 +334,72 @@ async function handle(req: Request): Promise<Response> {
     throw new HttpError(503, 'PROVIDER_UNAVAILABLE', 'Voice processing is not available right now. Please type your answer.', false, code);
   }
 
-  const inputKind = input.audio_evidence_id ? 'audio' : 'text';
-  const { turn, created } = await claimTurn(db, input.incident_revision_id, input.client_turn_id, inputKind);
-  if (!created) {
-    if (turn.status === 'completed' && turn.extraction_proposals?.response) {
-      return replay(turn.extraction_proposals);
-    }
-    const fresh = Date.now() - new Date(turn.updated_at).getTime() < STALE_PROCESSING_MS;
-    if (turn.status === 'processing' && fresh) {
-      throw new HttpError(409, 'PROVIDER_UNAVAILABLE', 'This answer is still being processed.', true, 'turn_in_progress');
-    }
-    // failed / pending / stale processing: take it over and retry.
-    await updateTurn(db, turn.id, { status: 'processing', error_code: null, input_kind: inputKind });
+  const language = revision.language === 'es' ? 'es' : 'en';
+  const turn = await beginTurn(db, input, language);
+  if (turn.status === 'completed' && turn.proposals?.response) {
+    log({ event: 'turn_replayed', revision_id: revision.id, turn_id: turn.turn_id, status: 'completed' });
+    return replay(turn.proposals);
   }
+  if (turn.status === 'processing') {
+    const current = await readTurn(db, revision.id, input.client_turn_id);
+    const fresh = current ? Date.now() - new Date(current.updated_at).getTime() < STALE_PROCESSING_MS : true;
+    if (fresh) throw new HttpError(409, 'PROVIDER_UNAVAILABLE', 'This answer is still being processed.', true, 'turn_in_progress');
+    // stale processing: take it over below
+  }
+  await recordTurn(db, revision.id, turn.turn_id, { status: 'processing' });
 
+  const ctx = { revision_id: revision.id, turn_id: turn.turn_id };
   const started = performance.now();
   const latency = { stt: 0, llm: 0 };
+  const inputKind = input.audio_evidence_id ? 'audio' : 'text';
   try {
     let transcript: string;
     if (input.audio_evidence_id) {
-      const ctx = { revision_id: input.incident_revision_id, turn_id: turn.id };
-      const audio = await loadAudio(db, input.incident_revision_id, input.audio_evidence_id, ctx);
-      const lang = (revision as { language?: string }).language || 'en';
-      const stt = await timed(() => providers.stt.transcribe(audio.blob, lang, audio.filename));
-      transcript = stt.value;
+      const audio = await loadAudio(db, revision.id, input.audio_evidence_id, ctx);
+      const stt = await timed(() => providers.stt.transcribe(audio.blob, language, audio.filename));
+      transcript = stt.value.trim();
       latency.stt = stt.ms;
       log({ event: 'stage', stage: 'stt', ...ctx, status: 'ok', mode: providers.mode, filename: audio.filename, ms: stt.ms, chars: transcript.length });
     } else {
       transcript = (input.text ?? '').trim();
     }
-
-    let result: ValidationResult = { applied: [], suggested: [], rejected: [] };
-    if (transcript) {
-      const llm = await timed(() =>
-        providers.extract.extract({ transcript, questionKey: question.key, catalog }),
-      );
-      latency.llm = llm.ms;
-      result = validateProposals(llm.value, transcript, catalog);
-
-      // The current open question always keeps the driver's own words if extraction did not fill it.
-      // A narrative question (the driver's whole story) always stores the full transcript: models tend to
-      // shorten it, which silently drops facts from the story.
-      const ownWords = { key: question.key, value: transcript, confidence: 1, evidence_quote: transcript };
-      if (question.narrative) {
-        result.applied = [...result.applied.filter((p) => p.key !== question.key), ownWords];
-        result.suggested = result.suggested.filter((p) => p.key !== question.key);
-      } else if (question.ui === 'voice_open' && !result.applied.some((p) => p.key === question.key)) {
-        result.applied.push(ownWords);
-        result.suggested = result.suggested.filter((p) => p.key !== question.key);
-      }
+    // record_incident_turn_result requires a transcript for 'completed'.
+    if (!transcript) {
+      throw new HttpError(400, 'VALIDATION_FAILED', 'We did not catch any words. Please try again or type your answer.', false, 'empty_transcript');
     }
 
-    const keptExisting = await writeAnswers(db, input.incident_revision_id, userId, turn.id, result.applied);
+    const llm = await timed(() => providers.extract.extract({ transcript, questionKey: question.key, catalog }));
+    latency.llm = llm.ms;
+    const result = withOwnWords(validateProposals(llm.value, transcript, catalog), question, transcript);
 
     const response: TurnResponse = {
-      turn_id: turn.id,
+      turn_id: turn.turn_id,
       status: 'completed',
       transcript,
-      applied: result.applied.filter((p) => !keptExisting.includes(p.key)),
+      applied: result.applied,
       suggested: result.suggested,
       latency_ms: latency,
       mode: providers.mode,
-      kept_existing: keptExisting,
     };
     const stored: StoredExtraction = {
-      version: 1,
+      version: 2,
       question_key: question.key,
       mode: providers.mode,
+      forms,
+      fallback_forms: fallbackForms,
       rejected: result.rejected,
-      kept_existing: keptExisting,
       response,
       response_body: JSON.stringify(response),
     };
-    await updateTurn(db, turn.id, { status: 'completed', transcript, extraction_proposals: stored, error_code: null });
+    await recordTurn(db, revision.id, turn.turn_id, { status: 'completed', transcript, proposals: stored });
 
     log({
       event: 'turn_completed',
-      revision_id: input.incident_revision_id,
-      turn_id: turn.id,
+      ...ctx,
       status: 'completed',
       mode: providers.mode,
       input_kind: inputKind,
+      forms,
       applied: response.applied.length,
       suggested: response.suggested.length,
       rejected: result.rejected.length,
@@ -426,22 +414,17 @@ async function handle(req: Request): Promise<Response> {
           ? new HttpError(503, 'PROVIDER_UNAVAILABLE', 'We could not process that answer. Try again or type it instead.', error.retryable, error.code)
           : new HttpError(503, 'PROVIDER_UNAVAILABLE', 'Something went wrong. Please try again.', true, 'internal');
 
-    await db
-      .from('conversation_turns')
-      .update({ status: 'failed', error_code: httpError.errorCode })
-      .eq('id', turn.id)
-      .then(() => undefined, () => undefined);
+    // Best effort: the turn stays retryable with the same client_turn_id.
+    await recordTurn(db, revision.id, turn.turn_id, { status: 'failed', errorCode: httpError.errorCode }).catch(() => undefined);
 
     const providerInfo = error instanceof ProviderError ? error.info : {};
     log({
       event: 'turn_failed',
-      revision_id: input.incident_revision_id,
-      turn_id: turn.id,
+      ...ctx,
       status: 'failed',
       mode: providers.mode,
       input_kind: inputKind,
       error_code: httpError.errorCode,
-      // stage = stt | llm for provider failures; validation/storage failures carry it in error_code.
       stage: error instanceof ProviderError ? error.code.split('_')[0] : undefined,
       provider_status: providerInfo.status,
       provider_error_type: providerInfo.type,
@@ -454,9 +437,7 @@ async function handle(req: Request): Promise<Response> {
 
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders });
-  if (req.method !== 'POST') {
-    return errorResponse(new HttpError(405, 'VALIDATION_FAILED', 'Use POST.', false));
-  }
+  if (req.method !== 'POST') return errorResponse(new HttpError(405, 'VALIDATION_FAILED', 'Use POST.', false));
   try {
     return await handle(req);
   } catch (error) {

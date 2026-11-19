@@ -3,11 +3,14 @@
 // No module-level Deno access so this file can also be imported by Node-based tests.
 import type { CatalogEntry } from './catalog.ts';
 
+/** What an extractor returns. `key` is a catalog key ("<form_key>.<field_key>"); validation does the rest. */
 export type RawProposal = {
   key: string;
   value: string | string[];
   confidence: number;
   evidence_quote: string;
+  /** false when the value is inferred rather than explicitly said; validation then caps confidence at 0.6 */
+  stated?: boolean;
 };
 
 export type ExtractInput = { transcript: string; questionKey: string; catalog: CatalogEntry[] };
@@ -191,12 +194,13 @@ function extractionSchema(catalog: CatalogEntry[]) {
         items: {
           type: 'object',
           additionalProperties: false,
-          required: ['key', 'value', 'confidence', 'evidence_quote'],
+          required: ['key', 'value', 'confidence', 'evidence_quote', 'stated'],
           properties: {
             key: { type: 'string', enum: catalog.map((q) => q.key) },
             value: { anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }] },
             confidence: { type: 'number' },
             evidence_quote: { type: 'string' },
+            stated: { type: 'boolean' },
           },
         },
       },
@@ -222,12 +226,13 @@ export function buildExtractionInstructions(questionKey: string, catalog: Catalo
     `The current question is "${questionKey}" — answer it first if the transcript answers it.`,
     'Also extract any other question below that the transcript clearly answers.',
     'Rules:',
-    '- Never guess or infer beyond what was said. If something is not stated, leave it out.',
+    '- Never invent facts. If something is not said or clearly implied, leave it out.',
     '- evidence_quote must be copied verbatim from the transcript (a short exact substring).',
     "- A value must be fully supported by its evidence_quote. If it needs two separate parts of the transcript, use those quotes joined with ' … '.",
-    "- property_damaged and property_owner are ONLY third-party property (fences, buildings, poles, other people's goods) — never the driver's own truck or trailer. Damage to the driver's truck goes only to truck_damage.",
-    '- For enum questions use only the allowed values; for list questions return an array of allowed values.',
-    '- confidence is between 0 and 1: 0.9+ when stated explicitly, lower when implied.',
+    "- Questions about damaged property mean ONLY third-party property (fences, buildings, poles, other people's goods) — never the driver's own truck or trailer. Damage to the driver's own truck belongs only in questions about the truck.",
+    '- For enum questions use only the allowed values; for list questions return an array of allowed values. Yes/no questions use "true" or "false".',
+    '- stated is true only when the driver explicitly says it. If the value is inferred, implied or a reasonable guess, set stated to false and confidence to at most 0.6.',
+    '- confidence is between 0 and 1: 0.9+ when stated explicitly and unambiguously.',
     '- Return an empty proposals array if nothing applies.',
     'Questions:',
     questions,
@@ -424,61 +429,73 @@ export class MockStt implements SttProvider {
   }
 }
 
-type MockRule = { key: string; value: string; pattern: RegExp };
+/** `field` is a field key; the rule applies to every catalog entry with that field key whose options include `value`. */
+type MockRule = { field: string; value: string; pattern: RegExp };
 
 // Deterministic keyword rules. Patterns are case-insensitive; the matched substring is the evidence quote.
+// Option-valued rules serve the stub catalog; "true"/"false" rules serve boolean fields in form definitions.
 export const MOCK_RULES: readonly MockRule[] = [
-  { key: 'involved', value: 'another_vehicle', pattern: /\b(?:sedan|car|suv|pickup|minivan)\b/i },
-  { key: 'involved', value: 'another_vehicle', pattern: /\btruck cut\b/i },
-  { key: 'involved', value: 'object', pattern: /\b(?:fence|bollard|pole|wall|gate)\b/i },
-  { key: 'involved', value: 'just_my_truck', pattern: /\bjust my truck\b/i },
-  { key: 'trip', value: 'dispatched_load', pattern: /\b(?:dispatched|delivery)\b/i },
-  { key: 'weather_road', value: 'fog', pattern: /\bfog(?:gy)?\b/i },
-  { key: 'weather_road', value: 'rain', pattern: /\brain(?:ing|y)?\b/i },
-  { key: 'weather_road', value: 'ice_snow', pattern: /\b(?:snow(?:ing|y)?|icy)\b/i },
-  { key: 'weather_road', value: 'clear', pattern: /\bclear\b/i },
-  { key: 'place_type', value: 'our_yard', pattern: /\bour yard\b/i },
-  { key: 'place_type', value: 'customer_site', pattern: /\bcustomer'?s? (?:dock|site)\b/i },
-  { key: 'injuries', value: 'no_one', pattern: /\b(?:nobody|no one|no-one)\s+(?:was\s+|got\s+)?(?:hurt|injured)\b/i },
-  { key: 'injuries', value: 'me', pattern: /\b(?:hurt|injured) my\b/i },
-  { key: 'truck_damage', value: 'front_bumper', pattern: /\bfront bumper\b/i },
-  { key: 'truck_damage', value: 'rear', pattern: /\b(?:rear bumper|revers(?:ing|ed))\b/i },
-  { key: 'truck_damage', value: 'no_damage', pattern: /\btruck is fine\b/i },
-  { key: 'drivable', value: 'needs_tow', pattern: /\btow(?:ed|ing)?\b/i },
-  { key: 'police', value: 'came', pattern: /\bpolice (?:came|showed up|arrived)\b/i },
-  { key: 'police', value: 'no_police', pattern: /\bno police\b/i },
+  { field: 'involved', value: 'another_vehicle', pattern: /\b(?:sedan|car|suv|pickup|minivan)\b/i },
+  { field: 'involved', value: 'another_vehicle', pattern: /\btruck cut\b/i },
+  { field: 'involved', value: 'object', pattern: /\b(?:fence|bollard|pole|wall|gate)\b/i },
+  { field: 'involved', value: 'just_my_truck', pattern: /\bjust my truck\b/i },
+  { field: 'other_vehicle', value: 'true', pattern: /\b(?:sedan|car|suv|pickup|minivan)\b/i },
+  { field: 'other_vehicle', value: 'false', pattern: /\bjust my truck\b/i },
+  { field: 'property_damaged', value: 'true', pattern: /\b(?:fence|bollard|pole|wall|gate)\b/i },
+  { field: 'delivery_work', value: 'true', pattern: /\b(?:delivery|delivering|unloading)\b/i },
+  { field: 'trip', value: 'dispatched_load', pattern: /\b(?:dispatched|delivery)\b/i },
+  { field: 'weather_road', value: 'fog', pattern: /\bfog(?:gy)?\b/i },
+  { field: 'weather_road', value: 'rain', pattern: /\brain(?:ing|y)?\b/i },
+  { field: 'weather_road', value: 'ice_snow', pattern: /\b(?:snow(?:ing|y)?|icy)\b/i },
+  { field: 'weather_road', value: 'clear', pattern: /\bclear\b/i },
+  { field: 'place_type', value: 'our_yard', pattern: /\bour yard\b/i },
+  { field: 'place_type', value: 'customer_site', pattern: /\bcustomer'?s? (?:dock|site)\b/i },
+  { field: 'injuries', value: 'no_one', pattern: /\b(?:nobody|no one|no-one)\s+(?:was\s+|got\s+)?(?:hurt|injured)\b/i },
+  { field: 'injuries', value: 'false', pattern: /\b(?:nobody|no one|no-one)\s+(?:was\s+|got\s+)?(?:hurt|injured)\b/i },
+  { field: 'injuries', value: 'me', pattern: /\b(?:hurt|injured) my\b/i },
+  { field: 'injuries', value: 'true', pattern: /\b(?:hurt|injured) my\b/i },
+  { field: 'truck_damage', value: 'front_bumper', pattern: /\bfront bumper\b/i },
+  { field: 'truck_damage', value: 'rear', pattern: /\b(?:rear bumper|revers(?:ing|ed))\b/i },
+  { field: 'truck_damage', value: 'no_damage', pattern: /\btruck is fine\b/i },
+  { field: 'drivable', value: 'needs_tow', pattern: /\btow(?:ed|ing)?\b/i },
+  { field: 'police', value: 'came', pattern: /\bpolice (?:came|showed up|arrived)\b/i },
+  { field: 'police', value: 'true', pattern: /\bpolice (?:came|showed up|arrived)\b/i },
+  { field: 'police', value: 'no_police', pattern: /\bno police\b/i },
+  { field: 'police', value: 'false', pattern: /\bno police\b/i },
 ];
 
 export const MOCK_CONFIDENCE = 0.9;
 
+const fieldOf = (entry: CatalogEntry) => entry.fieldKey ?? entry.key;
+
 export class MockExtract implements ExtractProvider {
   extract({ transcript, questionKey, catalog }: ExtractInput): Promise<RawProposal[]> {
-    const known = new Set(catalog.map((q) => q.key));
     const proposals: RawProposal[] = [];
     const seen = new Set<string>();
+    const text = transcript.trim();
 
-    if (questionKey === 'what_happened' && known.has('what_happened') && transcript.trim()) {
-      proposals.push({
-        key: 'what_happened',
-        value: transcript.trim(),
-        confidence: MOCK_CONFIDENCE,
-        evidence_quote: transcript.trim(),
-      });
+    // The current narrative question gets the whole transcript.
+    const current = catalog.find((q) => q.key === questionKey || fieldOf(q) === questionKey);
+    if (current?.narrative && text) {
+      proposals.push({ key: current.key, value: text, confidence: MOCK_CONFIDENCE, evidence_quote: text, stated: true });
     }
 
     for (const rule of MOCK_RULES) {
-      const id = `${rule.key}:${rule.value}`;
-      if (!known.has(rule.key) || seen.has(id)) continue;
       const match = rule.pattern.exec(transcript);
       if (!match) continue;
-      seen.add(id);
-      const entry = catalog.find((q) => q.key === rule.key);
-      proposals.push({
-        key: rule.key,
-        value: entry?.extractType === 'enum_list' ? [rule.value] : rule.value,
-        confidence: MOCK_CONFIDENCE,
-        evidence_quote: transcript.slice(match.index, match.index + match[0].length),
-      });
+      for (const entry of catalog) {
+        const id = `${entry.key}:${rule.value}`;
+        if (fieldOf(entry) !== rule.field || entry.extractType === 'text' || seen.has(id)) continue;
+        if (!(entry.options ?? []).includes(rule.value)) continue;
+        seen.add(id);
+        proposals.push({
+          key: entry.key,
+          value: entry.extractType === 'enum_list' ? [rule.value] : rule.value,
+          confidence: MOCK_CONFIDENCE,
+          evidence_quote: transcript.slice(match.index, match.index + match[0].length),
+          stated: true,
+        });
+      }
     }
     return Promise.resolve(proposals);
   }

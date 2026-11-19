@@ -1,3 +1,6 @@
+# OUTDATED on Eng B's backend: this script seeds data with direct table inserts (incident_answers, evidence),
+# which the read-only grants now refuse (42501). Use scripts/curl/process-incident-turn.ps1 and the checks in
+# docs/voice-integration.md §5 instead. Kept for reference until it is rewritten against the RPCs.
 $ErrorActionPreference = 'Continue'
 $st = @{}; npx supabase status -o env 2>$null | ForEach-Object { if ("$_" -match '^([A-Z_]+)="?(.*?)"?$') { $st[$matches[1]] = $matches[2] } }
 $api = $st.API_URL; $anon = $st.PUBLISHABLE_KEY

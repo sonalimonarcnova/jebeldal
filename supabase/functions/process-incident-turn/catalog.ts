@@ -1,12 +1,16 @@
+// FALLBACK question catalog. The primary catalog is built at runtime from the revision's triggered forms
+// (form_catalog.ts); this stub is used only for a triggered form whose definition has no usable fields.
 // TODO(E1): replace with ../_shared/engine/graph.ts.
-// Temporary stub of the question catalog used for extraction until the engine lands on main.
 // Keys and option values follow docs/sprint-plan.md task E1 and the workbook "Question Bank" sheet.
 // Keep this file free of imports so it runs unchanged under Deno, Node (tests) and Metro.
 
 export type CatalogUi = 'voice_open' | 'single' | 'multi' | 'truck_diagram';
 export type ExtractType = 'text' | 'enum' | 'enum_list';
+/** How the validated value is stored: booleans travel as "true"/"false" options and are converted back. */
+export type ValueKind = 'text' | 'enum' | 'multi_enum' | 'boolean';
 
 export type CatalogEntry = {
+  /** Unique within a catalog. Runtime/fallback catalogs use "<form_key>.<field_key>". */
   key: string;
   prompt: string;
   ui: CatalogUi;
@@ -18,7 +22,24 @@ export type CatalogEntry = {
    * value-vs-evidence length check in validate.ts. TODO(E1): carry this flag into graph.ts.
    */
   narrative?: true;
+  /** Set on runtime and fallback catalogs (always present after forCatalogForm / buildFormCatalog). */
+  formKey?: string;
+  fieldKey?: string;
+  valueKind?: ValueKind;
+  required?: boolean;
+  maxLength?: number;
 };
+
+/** Stub entries for one form, keyed "<form_key>.<field_key>" like the runtime catalog. */
+export function stubCatalogFor(formKey: string): CatalogEntry[] {
+  return getCatalog().map((entry) => ({
+    ...entry,
+    key: `${formKey}.${entry.key}`,
+    formKey,
+    fieldKey: entry.key,
+    valueKind: entry.extractType === 'text' ? 'text' : entry.extractType === 'enum' ? 'enum' : 'multi_enum',
+  }));
+}
 
 const CATALOG: readonly CatalogEntry[] = [
   {

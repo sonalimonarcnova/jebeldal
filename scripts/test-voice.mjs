@@ -8,6 +8,9 @@ import { resolve } from 'node:path';
 const files = [
   'supabase/functions/process-incident-turn/validate.test.ts',
   'supabase/functions/process-incident-turn/mock_extract.test.ts',
+  'supabase/functions/process-incident-turn/providers.test.ts',
+  'supabase/functions/process-incident-turn/audio.test.ts',
+  'supabase/functions/process-incident-turn/form_catalog.test.ts',
 ];
 
 const tests = [];
