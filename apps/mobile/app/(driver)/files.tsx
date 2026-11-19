@@ -1,19 +1,13 @@
-import { useCallback, useState, type ComponentProps } from 'react';
-import { router, useFocusEffect } from 'expo-router';
+import { useCallback, useMemo, useState, type ComponentProps } from 'react';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
-import { Linking, Platform, ScrollView, StyleSheet, View } from 'react-native';
+import { Alert, Linking, Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
-import { ActivityIndicator, Card, HelperText, Text } from 'react-native-paper';
+import { router, useFocusEffect } from 'expo-router';
+import { ActivityIndicator, HelperText, Text } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import {
-  documentFileCategories,
-  driverFileCategoryLabel,
-  walkaroundPhotoCategories,
-  type DriverFile,
-  type DriverFileCategory,
-} from '../../src/features/files/model';
+import type { DriverFile, DriverFileCategory } from '../../src/features/files/model';
 import {
   createDriverFileUrl,
   describeFileError,
@@ -28,51 +22,79 @@ import { AppButton as Button } from '../../src/ui/AppButton';
 import { palette } from '../../src/ui/theme';
 
 type IconName = ComponentProps<typeof MaterialCommunityIcons>['name'];
+type ActiveTab = 'documents' | 'photos';
+type FileSlot = {
+  key: string;
+  label: string;
+  helperText: string;
+  emptyText: string;
+  categories: DriverFileCategory[];
+  icon: IconName;
+};
 
-function FileRow({
-  file,
-  onOpen,
-  onRetry,
-}: {
-  file: DriverFile;
-  onOpen: (file: DriverFile) => void;
-  onRetry: (file: DriverFile) => void;
-}) {
-  return (
-    <View style={styles.fileRow}>
-      <View style={styles.fileDetails}>
-        <Text variant="bodyMedium">{driverFileCategoryLabel(file.category)}</Text>
-        <Text variant="bodySmall" style={styles.secondary}>
-          {file.uploadStatus === 'uploaded'
-            ? new Date(file.createdAt).toLocaleDateString()
-            : file.uploadStatus === 'pending'
-              ? 'Upload pending'
-              : 'Upload failed'}
-        </Text>
-      </View>
-      {file.uploadStatus === 'uploaded' ? (
-        <Button
-          compact
-          mode="text"
-          icon="open-in-new"
-          accessibilityLabel={`Open ${driverFileCategoryLabel(file.category)}`}
-          onPress={() => onOpen(file)}
-        >
-          Open
-        </Button>
-      ) : (
-        <Button
-          compact
-          mode="text"
-          icon="refresh"
-          accessibilityLabel={`Retry ${driverFileCategoryLabel(file.category)} upload`}
-          onPress={() => onRetry(file)}
-        >
-          Retry
-        </Button>
-      )}
-    </View>
-  );
+const documentSlots: readonly FileSlot[] = [
+  {
+    key: 'commercial_license',
+    label: 'Commercial driver\'s license',
+    helperText: 'Front and back',
+    emptyText: 'Front and back · tap or drop',
+    categories: ['cdl_front', 'cdl_back'],
+    icon: 'file-document-outline',
+  },
+  {
+    key: 'dot_medical',
+    label: 'DOT medical card',
+    helperText: 'Current examiner\'s certificate',
+    emptyText: 'Current examiner\'s certificate · tap or drop',
+    categories: ['medical_card'],
+    icon: 'file-document-outline',
+  },
+  {
+    key: 'vehicle_registration',
+    label: 'Vehicle registration',
+    helperText: 'Cab card for your unit',
+    emptyText: 'Cab card for your unit · tap or drop',
+    categories: ['registration'],
+    icon: 'file-document-outline',
+  },
+  {
+    key: 'insurance_card',
+    label: 'Insurance card',
+    helperText: 'Keep it in the cab, too',
+    emptyText: 'Keep it in the cab, too · tap or drop',
+    categories: ['insurance_card'],
+    icon: 'file-document-outline',
+  },
+];
+
+const photoCategories: readonly { category: DriverFileCategory; label: string }[] = [
+  { category: 'walkaround_front', label: 'Front' },
+  { category: 'walkaround_driver_side', label: 'Driver side' },
+  { category: 'walkaround_rear', label: 'Rear' },
+  { category: 'walkaround_passenger_side', label: 'Passenger side' },
+];
+
+function latestByStatus(files: DriverFile[], status: DriverFile['uploadStatus']): DriverFile | null {
+  return files.find((file) => file.uploadStatus === status) ?? null;
+}
+
+function slotSubtitle(slot: FileSlot, files: DriverFile[]): string {
+  const requiredCount = slot.categories.length;
+  const uploadedCount = slot.categories.filter((category) =>
+    files.some((file) => file.category === category && file.uploadStatus === 'uploaded')).length;
+
+  if (files.some((file) => file.uploadStatus === 'failed')) return 'Upload failed · tap to retry';
+  if (files.some((file) => file.uploadStatus === 'pending')) return 'Upload pending · tap to retry';
+  if (uploadedCount >= requiredCount) return slot.helperText;
+  if (uploadedCount > 0) return `${uploadedCount}/${requiredCount} added · tap to finish`;
+  return slot.emptyText;
+}
+
+function photoStatus(files: DriverFile[]): { label: string; tone: 'neutral' | 'error' | 'success' } {
+  if (files.some((file) => file.uploadStatus === 'failed')) return { label: 'failed', tone: 'error' };
+  if (files.some((file) => file.uploadStatus === 'pending')) return { label: 'pending', tone: 'neutral' };
+  if (files.some((file) => file.uploadStatus === 'uploaded')) return { label: 'added', tone: 'success' };
+  return { label: 'missing', tone: 'neutral' };
 }
 
 export default function DriverFilesRoute() {
@@ -82,6 +104,7 @@ export default function DriverFilesRoute() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyCategory, setBusyCategory] = useState<DriverFileCategory | null>(null);
   const [pendingUpload, setPendingUpload] = useState<PendingDriverFile | null>(null);
+  const [activeTab, setActiveTab] = useState<ActiveTab>('documents');
 
   const refreshFiles = useCallback(async () => {
     setLoading(true);
@@ -192,6 +215,15 @@ export default function DriverFilesRoute() {
     }
   };
 
+  const pickForCategory = useCallback(async (category: DriverFileCategory, retryTarget?: DriverFile) => {
+    const isPhotoCategory = category.startsWith('walkaround_');
+    if (isPhotoCategory) {
+      await chooseTruckPhoto(category, retryTarget);
+    } else {
+      await chooseDocument(category, retryTarget);
+    }
+  }, []);
+
   const retryUpload = async () => {
     if (!pendingUpload) return;
     setBusyCategory(pendingUpload.category);
@@ -216,139 +248,231 @@ export default function DriverFilesRoute() {
     }
   };
 
-  const retryFile = (file: DriverFile) => {
-    if (file.mediaType === 'image') {
-      void chooseTruckPhoto(file.category, file);
-    } else {
-      void chooseDocument(file.category, file);
+  const handleDocumentSlotPress = async (slot: FileSlot) => {
+    const slotFiles = files.filter((file) => slot.categories.includes(file.category));
+    const failedFile = latestByStatus(slotFiles, 'failed');
+    if (failedFile) {
+      await pickForCategory(failedFile.category, failedFile);
+      return;
     }
+
+    const pendingFile = latestByStatus(slotFiles, 'pending');
+    if (pendingFile) {
+      await pickForCategory(pendingFile.category, pendingFile);
+      return;
+    }
+
+    const missingCategories = slot.categories.filter((category) =>
+      !slotFiles.some((file) => file.category === category && file.uploadStatus === 'uploaded'));
+    if (missingCategories.length > 1 && slot.key === 'commercial_license' && Platform.OS !== 'web') {
+      Alert.alert(
+        'Commercial driver\'s license',
+        'Choose which side to upload.',
+        [
+          { text: 'Front', onPress: () => { void pickForCategory('cdl_front'); } },
+          { text: 'Back', onPress: () => { void pickForCategory('cdl_back'); } },
+          { text: 'Cancel', style: 'cancel' },
+        ],
+      );
+      return;
+    }
+
+    if (missingCategories.length > 0) {
+      await pickForCategory(missingCategories[0]);
+      return;
+    }
+
+    const uploadedFile = latestByStatus(slotFiles, 'uploaded');
+    if (uploadedFile) await openFile(uploadedFile);
   };
 
-  const renderCategory = (category: DriverFileCategory, icon: IconName, isPhoto: boolean) => {
+  const handlePhotoCategoryPress = async (category: DriverFileCategory) => {
     const categoryFiles = files.filter((file) => file.category === category);
-    const hasUploadedFile = categoryFiles.some((file) => file.uploadStatus === 'uploaded');
-    const isBusy = busyCategory === category;
-
-    return (
-      <View key={category} style={styles.categoryRow}>
-        <View style={styles.categoryHeading}>
-          <View style={[styles.iconBox, isPhoto ? styles.photoIcon : styles.documentIcon]}>
-            <MaterialCommunityIcons
-              name={icon}
-              size={22}
-              color={isPhoto ? palette.secondary : palette.primary}
-              accessible={false}
-            />
-          </View>
-          <View style={styles.fileDetails}>
-            <Text variant="titleSmall">{driverFileCategoryLabel(category)}</Text>
-            <Text variant="bodySmall" style={styles.secondary}>
-              {hasUploadedFile ? 'Added' : isPhoto ? 'Walk-around photo' : 'PDF document'}
-            </Text>
-          </View>
-          <Button
-            mode={hasUploadedFile ? 'outlined' : 'contained'}
-            compact
-            icon={isPhoto ? 'camera-outline' : 'plus'}
-            accessibilityLabel={`${hasUploadedFile ? 'Add another' : 'Add'} ${driverFileCategoryLabel(category)}`}
-            onPress={() => void (isPhoto ? chooseTruckPhoto(category) : chooseDocument(category))}
-            disabled={Boolean(busyCategory)}
-            loading={isBusy}
-          >
-            {hasUploadedFile ? 'Add another' : 'Add'}
-          </Button>
-        </View>
-        {categoryFiles.map((file) => (
-          <FileRow
-            key={file.id}
-            file={file}
-            onOpen={(selected) => void openFile(selected)}
-            onRetry={retryFile}
-          />
-        ))}
-      </View>
-    );
+    const failed = latestByStatus(categoryFiles, 'failed');
+    if (failed) {
+      await pickForCategory(category, failed);
+      return;
+    }
+    const pending = latestByStatus(categoryFiles, 'pending');
+    if (pending) {
+      await pickForCategory(category, pending);
+      return;
+    }
+    const uploaded = latestByStatus(categoryFiles, 'uploaded');
+    if (uploaded) {
+      await openFile(uploaded);
+      return;
+    }
+    await pickForCategory(category);
   };
+
+  const handleRetakeWalkaround = async () => {
+    router.navigate('/(driver)/truck-photos');
+  };
+
+  const documentRows = useMemo(
+    () => documentSlots.map((slot) => {
+      const slotFiles = files.filter((file) => slot.categories.includes(file.category));
+      const isBusy = slot.categories.includes(busyCategory ?? 'cdl_front');
+      return {
+        slot,
+        subtitle: slotSubtitle(slot, slotFiles),
+        isBusy,
+      };
+    }),
+    [files, busyCategory],
+  );
 
   return (
     <SafeAreaView style={styles.safeArea} edges={['top']}>
       <ScrollView contentContainerStyle={styles.content}>
         <View style={styles.header}>
-          <Button
-            mode="text"
-            icon="chevron-left"
-            accessibilityLabel="Back to home"
-            onPress={() => router.navigate('/(driver)/home')}
-          >
-            Home
-          </Button>
-          <Text variant="headlineMedium" style={styles.title}>Files</Text>
-          <Text variant="bodyMedium" style={styles.secondary}>
-            Your documents and truck photos
+          <Text variant="headlineLarge" style={styles.title}>Files</Text>
+          <Text variant="bodyLarge" style={styles.subtitle}>
+            Everything your safety team or insurer may ask for.
           </Text>
+          <View style={styles.segmented} accessibilityRole="tablist" accessibilityLabel="File type">
+            <Pressable
+              style={({ pressed }) => [
+                styles.segmentButton,
+                activeTab === 'documents' && styles.segmentButtonActive,
+                pressed && styles.pressed,
+              ]}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: activeTab === 'documents' }}
+              onPress={() => setActiveTab('documents')}
+            >
+              <Text variant="titleMedium" style={activeTab === 'documents' ? styles.segmentTextActive : styles.segmentText}>
+                Documents
+              </Text>
+            </Pressable>
+            <Pressable
+              style={({ pressed }) => [
+                styles.segmentButton,
+                activeTab === 'photos' && styles.segmentButtonActive,
+                pressed && styles.pressed,
+              ]}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: activeTab === 'photos' }}
+              onPress={() => setActiveTab('photos')}
+            >
+              <Text variant="titleMedium" style={activeTab === 'photos' ? styles.segmentTextActive : styles.segmentText}>
+                Photos
+              </Text>
+            </Pressable>
+          </View>
         </View>
 
         {actionError ? <HelperText type="error">{actionError}</HelperText> : null}
         {pendingUpload ? (
-          <Card style={styles.card}>
-            <Card.Content style={styles.pendingContent}>
-              <Text variant="titleSmall">Upload not complete</Text>
-              <Text variant="bodySmall" style={styles.secondary}>
-                Retry the same file to finish saving it securely.
-              </Text>
-              <Button
-                mode="contained"
-                onPress={() => void retryUpload()}
-                disabled={Boolean(busyCategory)}
-                loading={busyCategory === pendingUpload.category}
-              >
-                Retry upload
-              </Button>
-            </Card.Content>
-          </Card>
+          <View style={styles.feedbackCard}>
+            <Text variant="titleSmall">Upload not complete</Text>
+            <Text variant="bodySmall" style={styles.feedbackText}>
+              Retry the same file to finish saving it securely.
+            </Text>
+            <Button
+              mode="contained"
+              onPress={() => void retryUpload()}
+              disabled={Boolean(busyCategory)}
+              loading={busyCategory === pendingUpload.category}
+            >
+              Retry upload
+            </Button>
+          </View>
         ) : null}
-
         {loadError ? (
-          <Card style={styles.card}>
-            <Card.Content style={styles.pendingContent}>
-              <Text variant="titleMedium">Files could not be loaded</Text>
-              <HelperText type="error">{loadError}</HelperText>
-              <Button mode="contained" onPress={() => void refreshFiles()}>
-                Retry
-              </Button>
-            </Card.Content>
-          </Card>
+          <View style={styles.feedbackCard}>
+            <Text variant="titleSmall">Files could not be loaded</Text>
+            <HelperText type="error">{loadError}</HelperText>
+            <Button mode="contained" onPress={() => void refreshFiles()}>
+              Retry
+            </Button>
+          </View>
         ) : null}
 
-        <Card style={styles.card}>
-          <Card.Content style={styles.section}>
-            <View>
-              <Text variant="titleLarge">Documents</Text>
-              <Text variant="bodyMedium" style={styles.secondary}>
-                Add a PDF, up to 50 MB. Files are private to your account.
-              </Text>
-            </View>
-            {loading ? <ActivityIndicator accessibilityLabel="Loading documents" /> : null}
-            {documentFileCategories.map((category) =>
-              renderCategory(category, 'file-document-outline', false),
-            )}
-          </Card.Content>
-        </Card>
+        {loading ? (
+          <View style={styles.loadingRow}>
+            <ActivityIndicator accessibilityLabel="Loading files" />
+          </View>
+        ) : null}
 
-        <Card style={styles.card}>
-          <Card.Content style={styles.section}>
-            <View>
-              <Text variant="titleLarge">Truck photos</Text>
-              <Text variant="bodyMedium" style={styles.secondary}>
-                Capture one photo for each walk-around view.
-              </Text>
+        {!loading && activeTab === 'documents' ? (
+          <View style={styles.list}>
+            {documentRows.map(({ slot, subtitle, isBusy }) => (
+              <Pressable
+                key={slot.key}
+                style={({ pressed }) => [styles.rowCard, pressed && styles.pressed]}
+                accessibilityRole="button"
+                accessibilityLabel={`${slot.label} ${subtitle}`}
+                onPress={() => void handleDocumentSlotPress(slot)}
+                disabled={isBusy}
+              >
+                <View style={styles.iconBox}>
+                  <MaterialCommunityIcons
+                    name={slot.icon}
+                    size={24}
+                    color="#9CA3AF"
+                    accessible={false}
+                  />
+                </View>
+                <View style={styles.rowTextWrap}>
+                  <Text variant="titleMedium" style={styles.rowTitle}>{slot.label}</Text>
+                  <Text variant="bodyMedium" style={styles.rowSubtitle}>{subtitle}</Text>
+                </View>
+                {isBusy ? <ActivityIndicator size="small" accessibilityLabel={`Uploading ${slot.label}`} /> : null}
+              </Pressable>
+            ))}
+          </View>
+        ) : null}
+
+        {!loading && activeTab === 'photos' ? (
+          <View style={styles.photosCard}>
+            <View style={styles.photosHeader}>
+              <Text variant="titleMedium" style={styles.photosTitle}>Unit walk-around</Text>
+              <Pressable
+                style={({ pressed }) => [styles.retakeButton, pressed && styles.pressed]}
+                accessibilityRole="button"
+                accessibilityLabel="Retake walk-around photos"
+                onPress={() => void handleRetakeWalkaround()}
+                hitSlop={10}
+              >
+                <Text variant="labelLarge" style={styles.retakeText}>Retake</Text>
+              </Pressable>
             </View>
-            {loading ? <ActivityIndicator accessibilityLabel="Loading truck photos" /> : null}
-            {walkaroundPhotoCategories.map((category) =>
-              renderCategory(category, 'camera-outline', true),
-            )}
-          </Card.Content>
-        </Card>
+            <View style={styles.photoStatuses}>
+              {photoCategories.map((item) => {
+                const categoryFiles = files.filter((file) => file.category === item.category);
+                const status = photoStatus(categoryFiles);
+                const isBusy = busyCategory === item.category;
+                return (
+                  <Pressable
+                    key={item.category}
+                    style={({ pressed }) => [
+                      styles.photoChip,
+                      status.tone === 'error' && styles.photoChipError,
+                      status.tone === 'success' && styles.photoChipSuccess,
+                      pressed && styles.pressed,
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel={`${item.label} ${status.label}`}
+                    onPress={() => void handlePhotoCategoryPress(item.category)}
+                    disabled={isBusy}
+                  >
+                    <Text variant="labelMedium" style={styles.photoChipText}>
+                      {`${item.label} · ${isBusy ? 'saving…' : status.label}`}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+            <Text variant="bodySmall" style={styles.photoFooter}>
+              Tap a side to add, retry, or open the latest photo.
+            </Text>
+            <Text variant="bodySmall" style={styles.photoFooter}>
+              From incident reports
+            </Text>
+          </View>
+        ) : null}
       </ScrollView>
     </SafeAreaView>
   );
@@ -357,76 +481,160 @@ export default function DriverFilesRoute() {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: palette.background,
+    backgroundColor: '#F8FAFC',
   },
   content: {
-    gap: 16,
-    padding: 20,
-    width: '100%',
-    maxWidth: 720,
     alignSelf: 'center',
-    paddingBottom: 28,
+    gap: 14,
+    maxWidth: 760,
+    paddingBottom: 32,
+    paddingHorizontal: 18,
+    paddingTop: 14,
+    width: '100%',
   },
   header: {
-    gap: 4,
+    gap: 8,
   },
   title: {
-    color: palette.text,
+    color: '#111827',
+    fontWeight: '700',
   },
-  secondary: {
-    color: palette.mutedText,
+  subtitle: {
+    color: '#6B7280',
   },
-  section: {
-    gap: 14,
-    padding: 18,
+  segmented: {
+    backgroundColor: '#E5E7EB',
+    borderRadius: 14,
+    flexDirection: 'row',
+    padding: 4,
   },
-  card: {
+  segmentButton: {
+    alignItems: 'center',
+    borderRadius: 11,
+    flex: 1,
+    justifyContent: 'center',
+    minHeight: 44,
+  },
+  segmentButtonActive: {
+    backgroundColor: palette.surface,
+    elevation: 2,
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 6,
+  },
+  segmentText: {
+    color: '#6B7280',
+    fontWeight: '600',
+  },
+  segmentTextActive: {
+    color: '#111827',
+    fontWeight: '700',
+  },
+  feedbackCard: {
     backgroundColor: palette.surface,
     borderColor: palette.border,
-    borderRadius: 18,
+    borderRadius: 14,
     borderWidth: StyleSheet.hairlineWidth,
-  },
-  pendingContent: {
     gap: 8,
-    padding: 18,
+    padding: 14,
   },
-  categoryRow: {
-    gap: 8,
-    borderTopColor: palette.border,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    paddingTop: 12,
+  feedbackText: {
+    color: palette.mutedText,
   },
-  categoryHeading: {
+  loadingRow: {
     alignItems: 'center',
-    flexDirection: 'row',
-    gap: 10,
-    minHeight: 52,
+    justifyContent: 'center',
+    minHeight: 36,
   },
-  fileDetails: {
-    flex: 1,
-    gap: 2,
+  list: {
+    gap: 10,
+  },
+  rowCard: {
+    alignItems: 'center',
+    backgroundColor: palette.surface,
+    borderColor: '#D1D5DB',
+    borderRadius: 18,
+    borderStyle: 'dashed',
+    borderWidth: 1.5,
+    flexDirection: 'row',
+    minHeight: 88,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
   },
   iconBox: {
     alignItems: 'center',
-    borderRadius: 12,
+    backgroundColor: '#F3F4F6',
+    borderRadius: 14,
     height: 44,
     justifyContent: 'center',
+    marginRight: 14,
     width: 44,
   },
-  documentIcon: {
-    backgroundColor: palette.primaryContainer,
+  rowTextWrap: {
+    flex: 1,
+    gap: 2,
   },
-  photoIcon: {
-    backgroundColor: palette.secondaryContainer,
+  rowTitle: {
+    color: '#111827',
+    fontWeight: '700',
   },
-  fileRow: {
+  rowSubtitle: {
+    color: '#6B7280',
+  },
+  photosCard: {
+    backgroundColor: palette.surface,
+    borderColor: palette.border,
+    borderRadius: 16,
+    borderWidth: StyleSheet.hairlineWidth,
+    gap: 12,
+    padding: 14,
+  },
+  photosHeader: {
     alignItems: 'center',
-    backgroundColor: palette.surfaceVariant,
-    borderRadius: 12,
     flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  photosTitle: {
+    color: '#111827',
+    fontWeight: '700',
+  },
+  retakeButton: {
+    borderRadius: 10,
+    minHeight: 32,
+    justifyContent: 'center',
+    paddingHorizontal: 8,
+  },
+  retakeText: {
+    color: palette.primary,
+    fontWeight: '700',
+  },
+  photoStatuses: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: 8,
-    minHeight: 52,
-    paddingLeft: 12,
-    paddingRight: 4,
+  },
+  photoChip: {
+    backgroundColor: '#EEF2FF',
+    borderRadius: 999,
+    minHeight: 36,
+    justifyContent: 'center',
+    paddingHorizontal: 12,
+  },
+  photoChipError: {
+    backgroundColor: '#FEE2E2',
+  },
+  photoChipSuccess: {
+    backgroundColor: '#DCFCE7',
+  },
+  photoChipText: {
+    color: '#374151',
+    fontWeight: '600',
+  },
+  photoFooter: {
+    color: '#6B7280',
+  },
+  pressed: {
+    opacity: 0.92,
   },
 });

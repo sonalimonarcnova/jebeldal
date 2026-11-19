@@ -84,6 +84,14 @@ const incidentEvidenceSchema = z.object({
   capture_time: z.string().nullable(),
 });
 
+const incidentSetupFileSchema = z.object({
+  user_file_id: z.string().uuid(),
+  category: z.string(),
+  media_type: z.enum(['image', 'document']),
+  object_path: z.string(),
+  captured_at: z.string().nullable(),
+});
+
 export type IncidentForm = {
   formKey: string;
   version: number;
@@ -138,6 +146,15 @@ export type IncidentDraft = {
   answers: IncidentAnswer[];
   groups: IncidentAnswerGroup[];
   evidence: IncidentEvidence[];
+  setupFiles: {
+    userFileId: string;
+    category: string;
+    mediaType: 'image' | 'document';
+    objectPath: string;
+    capturedAt: string | null;
+    signedUrl: string | null;
+    previewError: string | null;
+  }[];
 };
 
 function throwQueryError(operation: string, error: { code?: string; message: string }): never {
@@ -417,7 +434,7 @@ export async function loadIncidentDraft(revisionId: string): Promise<IncidentDra
     throw new Error('The pinned incident form list does not match the expected schema.');
   }
 
-  const [forms, answers, groups, evidence] = await Promise.all([
+  const [forms, answers, groups, evidence, setupFiles] = await Promise.all([
     Promise.all(parsedForms.data.map(async (form): Promise<IncidentForm> => {
       const definitionResponse = await supabase
         .from('form_definitions')
@@ -532,6 +549,43 @@ export async function loadIncidentDraft(revisionId: string): Promise<IncidentDra
         };
       }));
     })(),
+    (async (): Promise<IncidentDraft['setupFiles']> => {
+      const setupFilesResponse = await supabase
+        .from('incident_setup_files')
+        .select('user_file_id,category,media_type,object_path,captured_at')
+        .eq('incident_revision_id', revision.id)
+        .order('linked_at', { ascending: true });
+      if (setupFilesResponse.error) {
+        throwQueryError('Loading setup files linked to this incident', setupFilesResponse.error);
+      }
+      const parsedSetupFiles = z.array(incidentSetupFileSchema).safeParse(setupFilesResponse.data);
+      if (!parsedSetupFiles.success) {
+        throw new Error('The linked setup files do not match the expected schema.');
+      }
+      return Promise.all(parsedSetupFiles.data.map(async (item) => {
+        let signedUrl: string | null = null;
+        let previewError: string | null = null;
+        if (item.media_type === 'image') {
+          const signedResponse = await supabase.storage
+            .from('driver-files')
+            .createSignedUrl(item.object_path, 3600);
+          if (signedResponse.error) {
+            previewError = `Could not load linked setup photo (${signedResponse.error.statusCode ?? 'UNKNOWN'}): ${signedResponse.error.message}`;
+          } else {
+            signedUrl = signedResponse.data.signedUrl;
+          }
+        }
+        return {
+          userFileId: item.user_file_id,
+          category: item.category,
+          mediaType: item.media_type,
+          objectPath: item.object_path,
+          capturedAt: item.captured_at,
+          signedUrl,
+          previewError,
+        };
+      }));
+    })(),
   ]);
 
   const autoForm = forms.find((form) => form.formKey === 'auto');
@@ -559,5 +613,6 @@ export async function loadIncidentDraft(revisionId: string): Promise<IncidentDra
     answers,
     groups,
     evidence,
+    setupFiles,
   };
 }

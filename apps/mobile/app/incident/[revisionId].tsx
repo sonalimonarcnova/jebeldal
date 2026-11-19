@@ -80,6 +80,10 @@ import {
   type IncidentEvidence,
   type IncidentForm,
 } from '../../src/features/incidents/repository';
+import {
+  setupDocumentCategories,
+  walkaroundPhotoCategories,
+} from '../../src/features/files/model';
 import { formatLocation } from '../../src/features/incidents/model';
 import {
   clearCachedDraftEdits,
@@ -2207,6 +2211,17 @@ export default function IncidentDraftRoute() {
     if (answer) setHistoryAnswerId(answerIdentity(answer));
     setTimeout(() => scrollRef.current?.scrollTo({ y: offset, animated: true }), 0);
   };
+  const linkedSetupDocumentCategories = new Set(
+    draft.setupFiles
+      .filter((file) => file.mediaType === 'document')
+      .map((file) => file.category),
+  );
+  const linkedSetupPhotoCategories = new Set(
+    draft.setupFiles
+      .filter((file) => file.mediaType === 'image')
+      .map((file) => file.category),
+  );
+  const linkedSetupPreviewError = draft.setupFiles.find((file) => file.previewError !== null)?.previewError ?? null;
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -2297,6 +2312,25 @@ export default function IncidentDraftRoute() {
                 </HelperText>
               )}
               <Text variant="bodySmall">Driver confirmation was recorded on the server. No biometric data is uploaded.</Text>
+            </Card.Content>
+          </Card>
+        ) : null}
+        {!readOnly ? (
+          <Card>
+            <Card.Content style={styles.cardContent}>
+              <Text variant="titleMedium">Driver file setup carries over automatically</Text>
+              <Text variant="bodySmall">
+                Documents and walk-around photos saved in setup stay linked to your driver account while filing incidents.
+              </Text>
+              <Text variant="bodySmall">
+                {`Documents ${linkedSetupDocumentCategories.size}/${setupDocumentCategories.length} · Truck photos ${linkedSetupPhotoCategories.size}/${walkaroundPhotoCategories.length}`}
+              </Text>
+              {linkedSetupPreviewError ? (
+                <HelperText type="error" visible>{linkedSetupPreviewError}</HelperText>
+              ) : null}
+              <Button mode="outlined" onPress={() => router.navigate('/(driver)/files')}>
+                Open files setup
+              </Button>
             </Card.Content>
           </Card>
         ) : null}

@@ -282,7 +282,7 @@ export default function HomeRoute() {
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel={`Open truck photos, ${photosAdded} of ${walkaroundPhotoCategories.length} added`}
-                  onPress={() => router.navigate('/(driver)/files')}
+                  onPress={() => router.navigate('/(driver)/truck-photos')}
                   style={({ pressed }) => [styles.setupChip, pressed ? styles.pressed : null]}
                 >
                   <MaterialCommunityIcons
@@ -396,7 +396,7 @@ export default function HomeRoute() {
                     : 'your assigned unit'}`}
                   iconColor="#7C3AED"
                   iconBackground="#F5F0FF"
-                  onPress={() => router.navigate('/(driver)/files')}
+                  onPress={() => router.navigate('/(driver)/truck-photos')}
                 />
               </View>
               {creating ? <ActivityIndicator accessibilityLabel="Creating incident report" /> : null}
