@@ -18,7 +18,9 @@ import {
   Checkbox,
   Chip,
   HelperText,
+  Menu,
   ProgressBar,
+  SegmentedButtons,
   Text,
   TextInput,
 } from 'react-native-paper';
@@ -278,6 +280,62 @@ const answerStateActions: Partial<Record<PersistedAnswerState, string>> = {
   pending_follow_up: 'Follow up later',
 };
 
+function EnumFieldEditor({
+  field,
+  label,
+  value,
+  onChange,
+  disabled,
+}: {
+  field: FormFieldDefinition;
+  label: string;
+  value: unknown;
+  onChange: (value: unknown) => void;
+  disabled: boolean;
+}) {
+  const [menuVisible, setMenuVisible] = useState(false);
+  const selectedOption = field.options.find((option) => option.value === value);
+
+  return (
+    <View style={styles.fieldControl}>
+      <Text variant="labelLarge">{label}{field.required ? ' · Required' : ''}</Text>
+      <Menu
+        visible={menuVisible}
+        onDismiss={() => setMenuVisible(false)}
+        anchorPosition="bottom"
+        contentStyle={styles.dropdownMenu}
+        anchor={
+          <Button
+            mode="outlined"
+            icon={menuVisible ? 'chevron-up' : 'chevron-down'}
+            onPress={() => setMenuVisible(true)}
+            disabled={disabled}
+            accessibilityLabel={`${label}: ${selectedOption?.label ?? 'Choose an option'}`}
+            style={styles.dropdownButton}
+            contentStyle={styles.dropdownButtonContent}
+            labelStyle={styles.dropdownButtonLabel}
+          >
+            {selectedOption?.label ?? 'Choose an option'}
+          </Button>
+        }
+      >
+        {field.options.map((option) => (
+          <Menu.Item
+            key={option.value}
+            title={option.label}
+            trailingIcon={option.value === value ? 'check' : undefined}
+            accessibilityState={{ selected: option.value === value }}
+            onPress={() => {
+              onChange(option.value);
+              setMenuVisible(false);
+            }}
+          />
+        ))}
+      </Menu>
+    </View>
+  );
+}
+
 function IncidentFieldEditor({
   field,
   value,
@@ -321,24 +379,16 @@ function IncidentFieldEditor({
     return (
       <View style={styles.fieldControl}>
         <Text variant="labelLarge">{label}{field.required ? ' · Required' : ''}</Text>
-        <View style={styles.choiceRow}>
-          <Button
-            mode={value === true ? 'contained' : 'outlined'}
-            onPress={() => onChange(true)}
-            disabled={disabled}
-          >
-            Yes
-          </Button>
-          <Button
-            mode={value === false ? 'contained' : 'outlined'}
-            onPress={() => onChange(false)}
-            disabled={disabled}
-          >
-            No
-          </Button>
-        </View>
+        <SegmentedButtons
+          value={value === true ? 'yes' : value === false ? 'no' : ''}
+          onValueChange={(selected) => onChange(selected === 'yes')}
+          buttons={[
+            { value: 'yes', label: 'Yes', disabled },
+            { value: 'no', label: 'No', disabled },
+          ]}
+        />
         {value === null || value === undefined ? (
-          <Text variant="bodySmall">Choose Yes or No.</Text>
+          <HelperText type="info" visible>Choose Yes or No.</HelperText>
         ) : null}
       </View>
     );
@@ -346,20 +396,13 @@ function IncidentFieldEditor({
 
   if (field.type === 'enum') {
     return (
-      <View style={styles.fieldControl}>
-        <Text variant="labelLarge">{label}{field.required ? ' · Required' : ''}</Text>
-        {field.options.map((option) => (
-          <Button
-            key={option.value}
-            mode={value === option.value ? 'contained' : 'outlined'}
-            onPress={() => onChange(option.value)}
-            disabled={disabled}
-            style={styles.optionButton}
-          >
-            {option.label}
-          </Button>
-        ))}
-      </View>
+      <EnumFieldEditor
+        field={field}
+        label={label}
+        value={value}
+        onChange={onChange}
+        disabled={disabled}
+      />
     );
   }
 
@@ -368,6 +411,7 @@ function IncidentFieldEditor({
     return (
       <View style={styles.fieldControl}>
         <Text variant="labelLarge">{label}{field.required ? ' · Required' : ''}</Text>
+        <HelperText type="info" visible>Select all that apply.</HelperText>
         {field.options.map((option) => (
           <Checkbox.Item
             key={option.value}
@@ -406,6 +450,8 @@ function IncidentFieldEditor({
       value={typeof value === 'string' || typeof value === 'number' ? String(value) : ''}
       onChangeText={onChange}
       disabled={disabled}
+      maxLength={field.validation?.maxLength}
+      accessibilityHint={field.required ? 'Required field' : undefined}
       style={isLongText ? styles.longText : undefined}
     />
   );
@@ -2193,7 +2239,11 @@ export default function IncidentDraftRoute() {
                   const value = fieldValues[fieldId] ?? initialFieldValue(field, null);
                   return (
                     <View key={fieldId} style={styles.field}>
-                      {showSection ? <Text variant="titleSmall">{field.section}</Text> : null}
+                      {showSection ? (
+                        <Text variant="titleSmall" style={styles.sectionHeading}>
+                          {field.section}
+                        </Text>
+                      ) : null}
                       <IncidentFieldEditor
                         field={field}
                         value={value}
@@ -2371,7 +2421,8 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   cardContent: {
-    gap: 12,
+    gap: 16,
+    padding: 18,
   },
   formHeader: {
     alignItems: 'center',
@@ -2427,27 +2478,49 @@ const styles = StyleSheet.create({
     paddingTop: 12,
   },
   groupInstance: {
-    backgroundColor: '#F3F4F7',
-    borderRadius: 8,
+    backgroundColor: '#F4F6FA',
+    borderColor: '#E4E8F0',
+    borderRadius: 14,
+    borderWidth: StyleSheet.hairlineWidth,
     gap: 12,
     padding: 12,
   },
   field: {
-    gap: 8,
+    gap: 10,
+    paddingVertical: 4,
   },
   fieldControl: {
-    gap: 8,
+    gap: 10,
   },
   choiceRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 12,
   },
-  optionButton: {
+  dropdownButton: {
     alignSelf: 'stretch',
+    borderRadius: 12,
+  },
+  dropdownButtonContent: {
+    flexDirection: 'row-reverse',
+    height: 52,
+    justifyContent: 'space-between',
+    paddingHorizontal: 8,
+  },
+  dropdownButtonLabel: {
+    flex: 1,
+    textAlign: 'left',
+  },
+  dropdownMenu: {
+    borderRadius: 14,
+  },
+  sectionHeading: {
+    color: '#394150',
+    marginTop: 6,
   },
   longText: {
-    minHeight: 140,
+    minHeight: 160,
+    textAlignVertical: 'top',
   },
   centered: {
     flex: 1,

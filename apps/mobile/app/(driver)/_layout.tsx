@@ -1,6 +1,7 @@
 import { Redirect } from 'expo-router';
 import { Tabs } from 'expo-router';
 import { useState } from 'react';
+import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { ActivityIndicator, Button, HelperText, Text } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -72,10 +73,56 @@ export default function DriverTabsLayout() {
   }
 
   return (
-    <Tabs screenOptions={{ headerShown: false, tabBarActiveTintColor: '#4F46E5' }}>
-      <Tabs.Screen name="home" options={{ title: 'Home', tabBarLabel: 'Home' }} />
-      <Tabs.Screen name="incidents" options={{ title: 'Incidents', tabBarLabel: 'Incidents' }} />
-      <Tabs.Screen name="profile" options={{ title: 'Profile', tabBarLabel: 'Profile' }} />
+    <Tabs
+      screenOptions={{
+        headerShown: false,
+        tabBarActiveTintColor: '#4F46E5',
+        tabBarInactiveTintColor: '#687184',
+        tabBarLabelStyle: { fontSize: 12, fontWeight: '500' },
+      }}
+    >
+      <Tabs.Screen
+        name="home"
+        options={{
+          title: 'Home',
+          tabBarLabel: 'Home',
+          tabBarIcon: ({ color, size }) => (
+            <MaterialCommunityIcons
+              name="home-outline"
+              color={typeof color === 'number' ? '#687184' : color ?? '#687184'}
+              size={size}
+            />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="incidents"
+        options={{
+          title: 'Incidents',
+          tabBarLabel: 'Incidents',
+          tabBarIcon: ({ color, size }) => (
+            <MaterialCommunityIcons
+              name="clipboard-text-outline"
+              color={typeof color === 'number' ? '#687184' : color ?? '#687184'}
+              size={size}
+            />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="profile"
+        options={{
+          title: 'Profile',
+          tabBarLabel: 'Profile',
+          tabBarIcon: ({ color, size }) => (
+            <MaterialCommunityIcons
+              name="account-circle-outline"
+              color={typeof color === 'number' ? '#687184' : color ?? '#687184'}
+              size={size}
+            />
+          ),
+        }}
+      />
     </Tabs>
   );
 }
