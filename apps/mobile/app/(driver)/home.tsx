@@ -1,22 +1,97 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { router, useFocusEffect } from 'expo-router';
 import { useCallback, useState } from 'react';
-import { ScrollView, StyleSheet, View } from 'react-native';
-import { ActivityIndicator, Avatar, Card, HelperText, Text } from 'react-native-paper';
+import {
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  View,
+  type GestureResponderEvent,
+} from 'react-native';
+import * as LocalAuthentication from 'expo-local-authentication';
+import { MaterialCommunityIcons } from '@expo/vector-icons';
+import { ActivityIndicator, HelperText, Text } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { useAuth } from '../../src/auth/AuthProvider';
 import { createIncidentDraft } from '../../src/features/incidents/repository';
-import { loadLatestHomeTrip } from '../../src/features/home/repository';
+import {
+  countUploadedCategories,
+  setupDocumentCategories,
+  walkaroundPhotoCategories,
+  type DriverFile,
+} from '../../src/features/files/model';
+import { describeFileError, loadDriverFiles } from '../../src/features/files/repository';
 import type { HomeTrip } from '../../src/features/home/model';
+import { loadLatestHomeTrip } from '../../src/features/home/repository';
 import { AppButton as Button } from '../../src/ui/AppButton';
 import { palette } from '../../src/ui/theme';
 
-function formatTripDate(value: string | null): string {
-  if (!value) {
-    return 'Time not provided';
-  }
+const faceIdSetupKeyPrefix = 'jebeldal:face-id-ready:';
+
+function formatHomeDate(value: Date): string {
+  return value.toLocaleDateString(undefined, {
+    weekday: 'long',
+    month: 'long',
+    day: 'numeric',
+  });
+}
+
+function formatTripTime(value: string | null): string {
+  if (!value) return 'Departure time unavailable';
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? 'Time not provided' : date.toLocaleString();
+  return Number.isNaN(date.getTime())
+    ? 'Departure time unavailable'
+    : `Depart ${date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`;
+}
+
+function initials(displayName: string | undefined): string {
+  const parts = displayName?.trim().split(/\s+/).filter(Boolean) ?? [];
+  return parts.slice(0, 2).map((part) => part[0]?.toUpperCase()).join('') || 'D';
+}
+
+function QuickAction({
+  icon,
+  title,
+  subtitle,
+  iconColor,
+  iconBackground,
+  onPress,
+  disabled = false,
+}: {
+  icon: React.ComponentProps<typeof MaterialCommunityIcons>['name'];
+  title: string;
+  subtitle: string;
+  iconColor: string;
+  iconBackground: string;
+  onPress: (event: GestureResponderEvent) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`${title}. ${subtitle}`}
+      accessibilityState={{ disabled }}
+      disabled={disabled}
+      onPress={onPress}
+      style={({ pressed }) => [styles.quickAction, pressed && !disabled ? styles.pressed : null]}
+    >
+      <View style={[styles.quickIcon, { backgroundColor: iconBackground }]}>
+        <MaterialCommunityIcons name={icon} size={24} color={iconColor} accessible={false} />
+      </View>
+      <View style={styles.quickCopy}>
+        <Text variant="titleMedium" style={styles.primaryText}>{title}</Text>
+        <Text variant="bodyMedium" style={styles.secondaryText}>{subtitle}</Text>
+      </View>
+      <MaterialCommunityIcons
+        name="chevron-right"
+        size={22}
+        color={palette.mutedText}
+        accessible={false}
+      />
+    </Pressable>
+  );
 }
 
 export default function HomeRoute() {
@@ -24,6 +99,11 @@ export default function HomeRoute() {
   const [trip, setTrip] = useState<HomeTrip | null>(null);
   const [loadingTrip, setLoadingTrip] = useState(true);
   const [tripError, setTripError] = useState<string | null>(null);
+  const [files, setFiles] = useState<DriverFile[]>([]);
+  const [loadingFiles, setLoadingFiles] = useState(true);
+  const [filesError, setFilesError] = useState<string | null>(null);
+  const [faceIdReady, setFaceIdReady] = useState(false);
+  const [setupError, setSetupError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
@@ -46,10 +126,32 @@ export default function HomeRoute() {
     }
   }, [session?.user.id]);
 
+  const refreshFiles = useCallback(async () => {
+    setLoadingFiles(true);
+    setFilesError(null);
+    try {
+      setFiles(await loadDriverFiles());
+    } catch (error) {
+      setFilesError(describeFileError(error, 'Could not load setup progress.'));
+    } finally {
+      setLoadingFiles(false);
+    }
+  }, []);
+
   useFocusEffect(
     useCallback(() => {
       void refreshTrip();
-    }, [refreshTrip]),
+      void refreshFiles();
+
+      const userId = session?.user.id;
+      if (userId) {
+        void AsyncStorage.getItem(`${faceIdSetupKeyPrefix}${userId}`)
+          .then((value) => setFaceIdReady(value === 'true'))
+          .catch((error: unknown) => {
+            setSetupError(describeFileError(error, 'Could not load device setup status.'));
+          });
+      }
+    }, [refreshFiles, refreshTrip, session?.user.id]),
   );
 
   const startIncident = async () => {
@@ -68,100 +170,239 @@ export default function HomeRoute() {
     }
   };
 
-  return (
-    <SafeAreaView style={styles.safeArea}>
-      <ScrollView contentContainerStyle={styles.content}>
-        <View style={styles.header}>
-          <View>
-            <Text variant="labelLarge">{new Date().toLocaleDateString()}</Text>
-            <Text variant="headlineMedium">Hi, {profile?.displayName ?? 'Driver'}</Text>
-          </View>
-          <Button
-            mode="outlined"
-            compact
-            icon="account-outline"
-            accessibilityLabel="Open profile"
-            onPress={() => router.navigate('/(driver)/profile')}
-          >
-            Profile
-          </Button>
-        </View>
+  const setupFaceId = async () => {
+    setSetupError(null);
+    const userId = session?.user.id;
+    if (!userId) {
+      setSetupError('Sign in again before setting up device authentication.');
+      return;
+    }
+    if (Platform.OS === 'web') {
+      setSetupError('Device biometric setup is available on an iOS or Android device.');
+      return;
+    }
 
-        <Card style={styles.card}>
-          <Card.Content style={styles.score}>
-            <Avatar.Text size={56} label="92" style={styles.scoreBadge} />
-            <View style={styles.flex}>
-              <Text variant="titleMedium">Driving score</Text>
-              <Text variant="bodyMedium" style={styles.scoreLabel}>Sample score</Text>
-              <Text variant="bodySmall" style={styles.secondary}>
-                Sample only · not a live fleet signal.
+    try {
+      if (!(await LocalAuthentication.hasHardwareAsync())) {
+        throw new Error('This device does not support biometric authentication.');
+      }
+      if ((await LocalAuthentication.getEnrolledLevelAsync()) === LocalAuthentication.SecurityLevel.NONE) {
+        throw new Error('Set up Face ID or a fingerprint in your device settings first.');
+      }
+      const result = await LocalAuthentication.authenticateAsync({
+        promptMessage: 'Set up JebelDAL device authentication',
+        cancelLabel: 'Cancel',
+        disableDeviceFallback: true,
+      });
+      if (!result.success) {
+        throw new Error('Device authentication was not completed. Your setup is unchanged.');
+      }
+      await AsyncStorage.setItem(`${faceIdSetupKeyPrefix}${userId}`, 'true');
+      setFaceIdReady(true);
+    } catch (error) {
+      setSetupError(describeFileError(error, 'Device authentication could not be set up.'));
+    }
+  };
+
+  const documentsAdded = countUploadedCategories(files, setupDocumentCategories);
+  const photosAdded = countUploadedCategories(files, walkaroundPhotoCategories);
+  const remainingSetupItems = Number(!faceIdReady) + Number(documentsAdded < setupDocumentCategories.length)
+    + Number(photosAdded < walkaroundPhotoCategories.length);
+
+  return (
+    <SafeAreaView style={styles.safeArea} edges={['top']}>
+      <ScrollView
+        style={styles.scroll}
+        contentContainerStyle={styles.scrollContent}
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.page}>
+          <View style={styles.header}>
+            <View style={styles.headerCopy}>
+              <Text variant="bodyMedium" style={styles.secondaryText}>{formatHomeDate(new Date())}</Text>
+              <Text variant="headlineLarge" style={styles.primaryText}>
+                Hi, {profile?.displayName ?? 'Driver'}
               </Text>
             </View>
-          </Card.Content>
-        </Card>
-
-        <Card style={styles.card}>
-          <Card.Content style={styles.section}>
-            <Text variant="titleMedium">Today</Text>
-            {loadingTrip ? (
-              <ActivityIndicator accessibilityLabel="Loading trip information" />
-            ) : tripError ? (
-              <>
-                <HelperText type="error">{tripError}</HelperText>
-                <Button onPress={() => void refreshTrip()}>Retry trip data</Button>
-              </>
-            ) : trip ? (
-              <>
-                <Text variant="bodyLarge">
-                  {trip.origin ?? 'Origin not provided'} {'->'} {trip.destination ?? 'Destination not provided'}
-                </Text>
-                <Text variant="bodyMedium">
-                  {profile?.vehicle?.unitNumber ?? 'No unit assigned'} · {formatTripDate(trip.startedAt)}
-                </Text>
-                {trip.purpose ? <Text variant="bodySmall">{trip.purpose}</Text> : null}
-                <Text variant="bodySmall" style={styles.secondary}>
-                  Trip information is fictional demo data.
-                </Text>
-              </>
-            ) : (
-              <Text variant="bodyMedium">No trip information is available.</Text>
-            )}
-          </Card.Content>
-        </Card>
-
-        {trip?.preTripStatus ? (
-          <Card style={styles.card}>
-            <Card.Content style={styles.section}>
-              <Text variant="titleMedium">Pre-trip inspection</Text>
-              <Text variant="bodyMedium">{trip.preTripStatus}</Text>
-              <Text variant="bodySmall" style={styles.secondary}>
-                Demo display data
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Open profile"
+              onPress={() => router.navigate('/(driver)/profile')}
+              style={({ pressed }) => [styles.profileAvatar, pressed ? styles.pressed : null]}
+            >
+              <Text variant="titleMedium" style={styles.avatarText}>
+                {initials(profile?.displayName)}
               </Text>
-            </Card.Content>
-          </Card>
-        ) : null}
+            </Pressable>
+          </View>
 
-        <View style={styles.section}>
-          <Text variant="titleLarge">Quick actions</Text>
-          <Button
-            mode="contained"
-            icon="plus"
-            accessibilityLabel="File an incident report"
-            onPress={() => void startIncident()}
-            disabled={creating}
-            loading={creating}
-            contentStyle={styles.actionButton}
-          >
-            File an incident report
-          </Button>
-          <Button
-            mode="outlined"
-            onPress={() => router.navigate('/(driver)/incidents')}
-            contentStyle={styles.actionButton}
-          >
-            View incidents
-          </Button>
-          {createError ? <HelperText type="error">{createError}</HelperText> : null}
+          <View style={styles.body}>
+            <View style={styles.card}>
+              <Text variant="titleMedium" style={styles.primaryText}>Finish setting up</Text>
+              <Text variant="bodyMedium" style={styles.secondaryText}>
+                {loadingFiles
+                  ? 'Checking your setup progress.'
+                  : filesError
+                    ? 'Setup progress is unavailable.'
+                    : remainingSetupItems === 0
+                      ? 'You’re ready to file reports.'
+                      : `${remainingSetupItems} left so your reports are ready to file.`}
+              </Text>
+              <View style={styles.setupChips}>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={faceIdReady ? 'Face ID set up on this device' : 'Set up Face ID'}
+                  onPress={() => void setupFaceId()}
+                  style={({ pressed }) => [styles.setupChip, pressed ? styles.pressed : null]}
+                >
+                  <MaterialCommunityIcons
+                    name={faceIdReady ? 'check-circle-outline' : 'face-recognition'}
+                    size={20}
+                    color={faceIdReady ? palette.success : palette.text}
+                    accessible={false}
+                  />
+                  <Text variant="bodyMedium" style={styles.primaryText}>Face ID</Text>
+                </Pressable>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Open documents, ${documentsAdded} of ${setupDocumentCategories.length} added`}
+                  onPress={() => router.navigate('/(driver)/files')}
+                  style={({ pressed }) => [styles.setupChip, pressed ? styles.pressed : null]}
+                >
+                  <MaterialCommunityIcons
+                    name="file-document-outline"
+                    size={20}
+                    color={palette.text}
+                    accessible={false}
+                  />
+                  <Text variant="bodyMedium" style={styles.primaryText}>
+                    Documents {documentsAdded}/{setupDocumentCategories.length}
+                  </Text>
+                </Pressable>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`Open truck photos, ${photosAdded} of ${walkaroundPhotoCategories.length} added`}
+                  onPress={() => router.navigate('/(driver)/files')}
+                  style={({ pressed }) => [styles.setupChip, pressed ? styles.pressed : null]}
+                >
+                  <MaterialCommunityIcons
+                    name="camera-outline"
+                    size={20}
+                    color={palette.text}
+                    accessible={false}
+                  />
+                  <Text variant="bodyMedium" style={styles.primaryText}>
+                    Truck photos {photosAdded}/{walkaroundPhotoCategories.length}
+                  </Text>
+                </Pressable>
+              </View>
+              {filesError ? <HelperText type="error">{filesError}</HelperText> : null}
+              {setupError ? <HelperText type="error">{setupError}</HelperText> : null}
+            </View>
+
+            <View style={[styles.card, styles.scoreCard]}>
+              <View style={styles.scoreRing}>
+                <Text variant="headlineSmall" style={styles.scoreText}>92</Text>
+              </View>
+              <View style={styles.scoreCopy}>
+                <Text variant="bodyMedium" style={styles.secondaryText}>Driving score</Text>
+                <Text variant="titleLarge" style={styles.primaryText}>Sample score</Text>
+                <Text variant="bodyMedium" style={styles.scoreNote}>
+                  Demo only · no live fleet ranking
+                </Text>
+              </View>
+            </View>
+
+            <View style={styles.card}>
+              <Text variant="bodyMedium" style={styles.secondaryText}>Today</Text>
+              {loadingTrip ? (
+                <ActivityIndicator accessibilityLabel="Loading trip information" />
+              ) : tripError ? (
+                <>
+                  <HelperText type="error">{tripError}</HelperText>
+                  <Button onPress={() => void refreshTrip()}>Retry trip data</Button>
+                </>
+              ) : (
+                <>
+                  <View style={styles.todayRow}>
+                    <View style={[styles.todayIcon, styles.routeIcon]}>
+                      <MaterialCommunityIcons
+                        name="routes"
+                        size={24}
+                        color={palette.primary}
+                        accessible={false}
+                      />
+                    </View>
+                    <View style={styles.todayCopy}>
+                      <Text variant="titleMedium" style={styles.primaryText}>
+                        {trip?.origin && trip.destination
+                          ? `${trip.origin} → ${trip.destination}`
+                          : 'No trip information available'}
+                      </Text>
+                      <Text variant="bodyMedium" style={styles.secondaryText}>
+                        {trip
+                          ? `${profile?.vehicle?.unitNumber ?? 'No unit assigned'} · ${formatTripTime(trip.startedAt)}`
+                          : 'Trip details will appear here when available.'}
+                      </Text>
+                    </View>
+                  </View>
+                  <View style={styles.todayRow}>
+                    <View style={[styles.todayIcon, styles.inspectionIcon]}>
+                      <MaterialCommunityIcons
+                        name="calendar-clock"
+                        size={24}
+                        color={palette.warning}
+                        accessible={false}
+                      />
+                    </View>
+                    <View style={styles.todayCopy}>
+                      <Text variant="titleMedium" style={styles.primaryText}>Pre-trip inspection</Text>
+                      <Text variant="bodyMedium" style={styles.secondaryText}>
+                        {trip?.preTripStatus ?? 'Inspection status unavailable'}
+                      </Text>
+                    </View>
+                  </View>
+                </>
+              )}
+            </View>
+
+            <View style={styles.quickSection}>
+              <Text variant="bodyMedium" style={styles.secondaryText}>Quick actions</Text>
+              <View style={styles.quickCard}>
+                <QuickAction
+                  icon="plus"
+                  title="File an incident report"
+                  subtitle="Talk it through, about 3 min"
+                  iconColor={palette.error}
+                  iconBackground="#FFF1F2"
+                  onPress={() => void startIncident()}
+                  disabled={creating}
+                />
+                <View style={styles.divider} />
+                <QuickAction
+                  icon="file-upload-outline"
+                  title="Add a document"
+                  subtitle="License, medical card, vehicle registration"
+                  iconColor={palette.primary}
+                  iconBackground="#EFF8FF"
+                  onPress={() => router.navigate('/(driver)/files')}
+                />
+                <View style={styles.divider} />
+                <QuickAction
+                  icon="camera-outline"
+                  title="Take truck photos"
+                  subtitle={`Walk-around for ${profile?.vehicle?.unitNumber
+                    ? `unit ${profile.vehicle.unitNumber}`
+                    : 'your assigned unit'}`}
+                  iconColor="#7C3AED"
+                  iconBackground="#F5F0FF"
+                  onPress={() => router.navigate('/(driver)/files')}
+                />
+              </View>
+              {creating ? <ActivityIndicator accessibilityLabel="Creating incident report" /> : null}
+              {createError ? <HelperText type="error">{createError}</HelperText> : null}
+            </View>
+          </View>
         </View>
       </ScrollView>
     </SafeAreaView>
@@ -171,49 +412,155 @@ export default function HomeRoute() {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: palette.background,
+    backgroundColor: palette.surface,
   },
-  content: {
-    gap: 16,
-    padding: 20,
+  scroll: {
+    backgroundColor: palette.surfaceVariant,
+  },
+  scrollContent: {
+    paddingBottom: 24,
+  },
+  page: {
     width: '100%',
     maxWidth: 720,
     alignSelf: 'center',
   },
   header: {
     alignItems: 'center',
+    backgroundColor: palette.surface,
     flexDirection: 'row',
     justifyContent: 'space-between',
+    paddingHorizontal: 24,
+    paddingVertical: 16,
   },
-  score: {
+  headerCopy: {
+    flex: 1,
+    gap: 2,
+  },
+  primaryText: {
+    color: palette.text,
+  },
+  secondaryText: {
+    color: palette.mutedText,
+  },
+  profileAvatar: {
     alignItems: 'center',
-    flexDirection: 'row',
+    backgroundColor: '#0A8EFF',
+    borderRadius: 30,
+    height: 60,
+    justifyContent: 'center',
+    marginLeft: 16,
+    width: 60,
+  },
+  avatarText: {
+    color: palette.surface,
+  },
+  body: {
     gap: 16,
     padding: 20,
   },
-  scoreBadge: {
-    backgroundColor: palette.primaryContainer,
-  },
-  scoreLabel: {
-    color: palette.primary,
-    fontWeight: '600',
-  },
   card: {
     backgroundColor: palette.surface,
-    borderColor: palette.border,
-    borderRadius: 18,
-    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 20,
+    gap: 8,
+    padding: 20,
   },
-  flex: {
+  setupChips: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 6,
+  },
+  setupChip: {
+    alignItems: 'center',
+    backgroundColor: palette.surfaceVariant,
+    borderRadius: 24,
+    flexDirection: 'row',
+    gap: 6,
+    minHeight: 40,
+    paddingHorizontal: 12,
+  },
+  scoreCard: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 16,
+  },
+  scoreRing: {
+    alignItems: 'center',
+    borderColor: '#32C75A',
+    borderRadius: 44,
+    borderWidth: 6,
+    height: 88,
+    justifyContent: 'center',
+    width: 88,
+  },
+  scoreText: {
+    color: palette.text,
+    fontWeight: '700',
+  },
+  scoreCopy: {
     flex: 1,
+    gap: 2,
   },
-  section: {
+  scoreNote: {
+    color: palette.success,
+  },
+  todayRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
     gap: 12,
+    marginTop: 4,
   },
-  secondary: {
-    color: palette.mutedText,
+  todayIcon: {
+    alignItems: 'center',
+    borderRadius: 13,
+    height: 52,
+    justifyContent: 'center',
+    width: 52,
   },
-  actionButton: {
-    minHeight: 48,
+  routeIcon: {
+    backgroundColor: '#EFF8FF',
+  },
+  inspectionIcon: {
+    backgroundColor: '#FFFBEB',
+  },
+  todayCopy: {
+    flex: 1,
+    gap: 2,
+  },
+  quickSection: {
+    gap: 8,
+  },
+  quickCard: {
+    backgroundColor: palette.surface,
+    borderRadius: 20,
+    overflow: 'hidden',
+  },
+  quickAction: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 12,
+    minHeight: 76,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  quickIcon: {
+    alignItems: 'center',
+    borderRadius: 14,
+    height: 52,
+    justifyContent: 'center',
+    width: 52,
+  },
+  quickCopy: {
+    flex: 1,
+    gap: 2,
+  },
+  divider: {
+    backgroundColor: palette.border,
+    height: StyleSheet.hairlineWidth,
+    marginLeft: 16,
+  },
+  pressed: {
+    opacity: 0.75,
   },
 });

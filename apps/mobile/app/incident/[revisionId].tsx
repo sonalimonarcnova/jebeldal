@@ -3,6 +3,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Alert,
   KeyboardAvoidingView,
+  Linking,
+  Modal,
   Image,
   Platform,
   Pressable,
@@ -12,6 +14,7 @@ import {
   type ScrollViewInstance,
 } from 'react-native';
 import DateTimePicker, { type DateTimePickerEvent } from '@react-native-community/datetimepicker';
+import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import * as Location from 'expo-location';
 import * as LocalAuthentication from 'expo-local-authentication';
@@ -114,6 +117,11 @@ type PhotoUploadState = {
   uri: string;
   contentType: string;
   status: 'uploading' | 'failed' | 'uploaded';
+};
+type LocalPhotoAsset = {
+  uri: string;
+  name: string;
+  mimeType: string | null;
 };
 
 const occurredAtFieldId = '__incident_details:occurred_at';
@@ -282,6 +290,14 @@ function issueActionLabel(action: string | null): string | null {
 function formTitle(form: IncidentForm): string {
   return form.definition?.title
     ?? form.formKey.replace(/[_-]+/g, ' ').replace(/\b\w/g, (letter) => letter.toLocaleUpperCase('en'));
+}
+
+function formTabLabel(form: IncidentForm): string {
+  const key = form.formKey.toLocaleLowerCase('en');
+  if (key.includes('auto') || key.includes('fleet')) return 'Auto';
+  if (key.includes('liability')) return 'GL';
+  if (key.includes('worker') || key.includes('comp')) return 'WC';
+  return formTitle(form);
 }
 
 function valuesEqual(field: FormFieldDefinition, value: unknown, savedValue: unknown): boolean {
@@ -691,19 +707,22 @@ export default function IncidentDraftRoute() {
   const [turnMessage, setTurnMessage] = useState<string | null>(null);
   const [detailMessage, setDetailMessage] = useState<string | null>(null);
   const [locationError, setLocationError] = useState<string | null>(null);
+  const [locationSettingsRequired, setLocationSettingsRequired] = useState(false);
   const [gpsLocation, setGpsLocation] = useState<FormJsonValue | null>(null);
   const [locationLoading, setLocationLoading] = useState(false);
   const [photoError, setPhotoError] = useState<string | null>(null);
+  const [cameraSettingsRequired, setCameraSettingsRequired] = useState(false);
+  const [evidenceMenuVisible, setEvidenceMenuVisible] = useState(false);
   const [photoUploads, setPhotoUploads] = useState<Record<string, PhotoUploadState>>({});
   const [photoBusy, setPhotoBusy] = useState(false);
   const [creatingGroup, setCreatingGroup] = useState<string | null>(null);
   const [deletingGroup, setDeletingGroup] = useState<string | null>(null);
   const [historyAnswerId, setHistoryAnswerId] = useState<string | null>(null);
+  const [selectedFormKey, setSelectedFormKey] = useState<string | null>(null);
   const [expandedForms, setExpandedForms] = useState<Record<string, boolean>>({});
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({});
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
   const [previewVisible, setPreviewVisible] = useState(false);
-  const [expandedPreviewForms, setExpandedPreviewForms] = useState<Record<string, boolean>>({});
   const [pendingSubmission, setPendingSubmission] = useState<PendingSubmission | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitIssues, setSubmitIssues] = useState<SubmitIssue[]>([]);
@@ -717,7 +736,9 @@ export default function IncidentDraftRoute() {
   const draftRef = useRef<IncidentDraft | null>(draft);
   const pendingTurnRef = useRef<{ questionId: string; text: string; clientTurnId: string } | null>(null);
   const scrollRef = useRef<ScrollViewInstance | null>(null);
-  const formOffsetsRef = useRef<Record<string, number>>({});
+  const detailsOffsetRef = useRef(0);
+  const evidenceOffsetRef = useRef(0);
+  const formSectionOffsetRef = useRef(0);
   const historyOffsetRef = useRef(0);
   const submitInFlightRef = useRef(false);
   draftRef.current = draft;
@@ -1562,17 +1583,30 @@ export default function IncidentDraftRoute() {
     setLocationLoading(true);
     setDetailMessage(null);
     setLocationError(null);
+    setLocationSettingsRequired(false);
     try {
-      const permission = await Location.requestForegroundPermissionsAsync();
-      if (permission.status !== 'granted') {
-        setDetailMessage('Location permission was not granted. You can enter a place manually.');
+      const currentPermission = await Location.getForegroundPermissionsAsync();
+      const permission = currentPermission.granted
+        ? currentPermission
+        : await Location.requestForegroundPermissionsAsync();
+      if (!permission.granted) {
+        setLocationSettingsRequired(!permission.canAskAgain);
+        setLocationError(permission.canAskAgain
+          ? 'Location permission is off. You can enter a place manually or allow access when prompted.'
+          : 'Location access is disabled for this app. Enter a place manually or enable it in Settings.');
         return;
       }
 
       const current = await Location.getCurrentPositionAsync({
         accuracy: Location.Accuracy.Balanced,
       });
-      const [address] = await Location.reverseGeocodeAsync(current.coords);
+      let address: Location.LocationGeocodedAddress | null = null;
+      let addressLookupFailed = false;
+      try {
+        [address] = await Location.reverseGeocodeAsync(current.coords);
+      } catch {
+        addressLookupFailed = true;
+      }
       const addressParts = address
         ? [
           address.name,
@@ -1605,10 +1639,13 @@ export default function IncidentDraftRoute() {
       setDetailMessage(
         addressParts.length
           ? `Current location ready${coordinates.accuracy !== null ? ` · ±${Math.round(coordinates.accuracy)} m` : ''}. Confirm or edit it before saving.`
-          : 'Address lookup was unavailable; current coordinates are ready. Confirm or edit them before saving.',
+          : addressLookupFailed
+            ? 'GPS coordinates are ready, but the address could not be resolved. Confirm or edit them before saving.'
+            : 'Address lookup was unavailable; current coordinates are ready. Confirm or edit them before saving.',
       );
-    } catch (error) {
-      setLocationError(`${errorMessage(error, 'Could not get the current location.')} You can enter a place manually.`);
+    } catch {
+      setLocationSettingsRequired(true);
+      setLocationError('Could not get a location fix right now. Enter a place manually or try again when location services are available.');
     } finally {
       setLocationLoading(false);
     }
@@ -1749,43 +1786,37 @@ export default function IncidentDraftRoute() {
     }
   };
 
-  const captureIncidentPhoto = async () => {
-    if (!draft || draft.status !== 'draft') return;
-    if (Platform.OS === 'web') {
-      setPhotoError('Incident photo capture is available on an iOS or Android device.');
-      return;
-    }
-    setPhotoBusy(true);
-    setPhotoError(null);
+  const addIncidentPhoto = async (
+    incidentDraft: NonNullable<typeof draft>,
+    asset: LocalPhotoAsset,
+  ) => {
     let createdEvidenceId: string | null = null;
     try {
-      const permission = await ImagePicker.requestCameraPermissionsAsync();
-      if (!permission.granted) {
-        setPhotoError('Camera permission is needed to capture incident evidence. Your draft is unchanged.');
-        return;
-      }
-      const capture = await ImagePicker.launchCameraAsync({
-        mediaTypes: ['images'],
-        quality: 0.8,
-      });
-      if (capture.canceled || !capture.assets[0]) return;
-
-      const asset = capture.assets[0];
       const response = await fetch(asset.uri);
-      if (!response.ok) throw new Error('The captured photo could not be read from this device.');
+      if (!response.ok) throw new Error('The selected image could not be read from this device.');
       const blob = await response.blob();
       if (blob.size <= 0 || blob.size > 50 * 1024 * 1024) {
-        throw new Error('The photo must be smaller than 50 MB. Capture a lower-resolution image and retry.');
+        throw new Error('The image must be smaller than 50 MB. Choose a smaller file and retry.');
       }
-      const contentType = asset.mimeType ?? blob.type ?? 'image/jpeg';
-      if (!['image/jpeg', 'image/png', 'image/webp'].includes(contentType)) {
-        throw new Error('The captured image format is not supported. Use JPEG, PNG, or WebP.');
+      const extensionType = /\.jpe?g$/i.test(asset.name)
+        ? 'image/jpeg'
+        : /\.png$/i.test(asset.name)
+          ? 'image/png'
+          : /\.webp$/i.test(asset.name)
+            ? 'image/webp'
+            : null;
+      const supportedTypes = new Set(['image/jpeg', 'image/png', 'image/webp']);
+      const contentType = [asset.mimeType, blob.type, extensionType]
+        .map((type) => type?.split(';', 1)[0].trim().toLocaleLowerCase('en'))
+        .find((type): type is string => Boolean(type && supportedTypes.has(type)));
+      if (!contentType) {
+        throw new Error('Choose a JPEG, PNG, or WebP image file.');
       }
 
       const evidence = await createIncidentEvidence(
-        draft,
+        incidentDraft,
         blob.size,
-        asset.fileName ?? 'Incident photo',
+        asset.name || 'Incident photo',
       );
       createdEvidenceId = evidence.evidenceId;
       setDraft((current) => current ? { ...current, version: evidence.revisionVersion } : current);
@@ -1800,11 +1831,80 @@ export default function IncidentDraftRoute() {
       if (createdEvidenceId) {
         try {
           await refreshDraftPreservingDirty();
-        } catch {
-          // Keep the captured file available for retry even if the status refresh fails.
+        } catch (refreshError) {
+          throw new Error(
+            `${errorMessage(error, 'The image could not be uploaded.')} The evidence status could not be refreshed: ${errorMessage(refreshError, 'Refresh failed.')}`,
+          );
         }
       }
-      setPhotoError(errorMessage(error, 'The incident photo could not be uploaded. Retry without losing the captured image.'));
+      throw error;
+    }
+  };
+
+  const captureIncidentPhoto = async () => {
+    const incidentDraft = draft;
+    if (!incidentDraft || incidentDraft.status !== 'draft') return;
+    if (Platform.OS === 'web') {
+      setPhotoError('Camera capture is available on an iOS or Android device. You can still choose an image file.');
+      return;
+    }
+    setPhotoBusy(true);
+    setPhotoError(null);
+    setCameraSettingsRequired(false);
+    try {
+      const currentPermission = await ImagePicker.getCameraPermissionsAsync();
+      const permission = currentPermission.granted
+        ? currentPermission
+        : currentPermission.canAskAgain
+          ? await ImagePicker.requestCameraPermissionsAsync()
+          : currentPermission;
+      if (!permission.granted) {
+        setCameraSettingsRequired(!permission.canAskAgain);
+        setPhotoError(permission.canAskAgain
+          ? 'Allow camera access to take a photo, or choose an image from Files instead.'
+          : 'Camera access is disabled for this app. Choose an image from Files or enable Camera in Settings.');
+        return;
+      }
+      const capture = await ImagePicker.launchCameraAsync({
+        mediaTypes: ['images'],
+        quality: 0.8,
+      });
+      if (capture.canceled || !capture.assets[0]) return;
+      const asset = capture.assets[0];
+      await addIncidentPhoto(incidentDraft, {
+        uri: asset.uri,
+        name: asset.fileName ?? 'Incident photo.jpg',
+        mimeType: asset.mimeType ?? null,
+      });
+    } catch (error) {
+      setPhotoError(errorMessage(error, 'The incident photo could not be added. Your draft is unchanged.'));
+    } finally {
+      setPhotoBusy(false);
+    }
+  };
+
+  const chooseIncidentImageFile = async () => {
+    const incidentDraft = draft;
+    if (!incidentDraft || incidentDraft.status !== 'draft') return;
+    setEvidenceMenuVisible(false);
+    setPhotoBusy(true);
+    setPhotoError(null);
+    try {
+      const selection = await DocumentPicker.getDocumentAsync({
+        type: ['image/jpeg', 'image/png', 'image/webp'],
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
+      if (selection.canceled) return;
+      const asset = selection.assets[0];
+      if (!asset) throw new Error('No image file was selected.');
+      await addIncidentPhoto(incidentDraft, {
+        uri: asset.uri,
+        name: asset.name,
+        mimeType: asset.mimeType ?? null,
+      });
+    } catch (error) {
+      setPhotoError(errorMessage(error, 'The selected image could not be added. Your draft is unchanged.'));
     } finally {
       setPhotoBusy(false);
     }
@@ -2068,11 +2168,44 @@ export default function IncidentDraftRoute() {
     ? answerValueId(historyAnswer.formKey, historyAnswer.fieldKey, historyAnswer.groupInstanceId)
     : null;
   const detailsDirty = dirtyFields[occurredAtFieldId] === true || dirtyFields[locationFieldId] === true;
+  const selectedForm = draft.forms.find((form) => form.formKey === selectedFormKey)
+    ?? draft.forms.find((form) => form.activationStatus === 'triggered')
+    ?? draft.forms[0]
+    ?? null;
+  const submissionDisabled = submitting
+    || !interviewComplete
+    || needsRefresh
+    || readinessLoading
+    || Object.values(dirtyFieldsRef.current).some(Boolean)
+    || cacheConflict !== null
+    || editCacheConflict.kind === 'conflict'
+    || (
+      !pendingSubmission
+      && (readinessVersion !== draft.version || submitIssues.length > 0)
+    );
+  const submissionLabel = pendingSubmission
+    ? 'Retry submission'
+    : 'Confirm on this device & submit';
+  const reviewSubmissionLabel = pendingSubmission ? 'Retry submission' : 'Confirm & submit';
   const returnToPreviousAnswer = () => {
     const previousAnswer = draft.answers.at(-1);
     if (!previousAnswer) return;
     setHistoryAnswerId(answerIdentity(previousAnswer));
     setTimeout(() => scrollRef.current?.scrollTo({ y: historyOffsetRef.current, animated: true }), 0);
+  };
+  const selectForm = (form: IncidentForm) => {
+    setSelectedFormKey(form.formKey);
+    if (form.activationStatus === 'triggered') {
+      setExpandedForms((current) => ({ ...current, [form.formKey]: true }));
+    }
+    setTimeout(() => {
+      scrollRef.current?.scrollTo({ y: formSectionOffsetRef.current, animated: true });
+    }, 0);
+  };
+  const openReviewSection = (offset: number, answer?: IncidentAnswer) => {
+    setPreviewVisible(false);
+    if (answer) setHistoryAnswerId(answerIdentity(answer));
+    setTimeout(() => scrollRef.current?.scrollTo({ y: offset, animated: true }), 0);
   };
 
   return (
@@ -2104,6 +2237,47 @@ export default function IncidentDraftRoute() {
               />
             ) : null}
           </View>
+          {draft.forms.length > 1 ? (
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.formTabs}
+              accessibilityLabel="Incident form tabs"
+            >
+              {draft.forms.map((form) => {
+                const formAnswers = draft.answers.filter((answer) => answer.formKey === form.formKey);
+                const unsavedCount = Object.entries(dirtyFields).filter(([fieldId, dirty]) => {
+                  return dirty && parseAnswerFieldId(fieldId)?.[0] === form.formKey;
+                }).length;
+                const issueCount = submitIssues.filter((issue) => issue.formKey === form.formKey).length;
+                const selected = selectedForm?.formKey === form.formKey;
+                return (
+                  <Pressable
+                    key={`tab:${form.formKey}`}
+                    accessibilityRole="tab"
+                    accessibilityState={{ selected }}
+                    accessibilityLabel={`${formTitle(form)}${form.activationStatus === 'triggered' ? ', active' : ', not triggered'}, ${formAnswers.length} saved${unsavedCount ? `, ${unsavedCount} unsaved` : ''}${issueCount ? `, ${issueCount} requirements need attention` : ''}`}
+                    onPress={() => selectForm(form)}
+                    style={({ pressed }) => [
+                      styles.formTab,
+                      selected && styles.formTabSelected,
+                      pressed && styles.formTabPressed,
+                    ]}
+                  >
+                    <Text
+                      variant="labelLarge"
+                      style={selected ? styles.formTabLabelSelected : styles.formTabLabel}
+                    >
+                      {formTabLabel(form)}
+                    </Text>
+                    <Text variant="bodySmall" style={styles.formTabMeta}>
+                      {`${formAnswers.length} saved${unsavedCount ? ` · ${unsavedCount} unsaved` : ''}${issueCount ? ` · ${issueCount} to fix` : ''}`}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </ScrollView>
+          ) : null}
         </View>
         <ScrollView
           ref={scrollRef}
@@ -2172,7 +2346,11 @@ export default function IncidentDraftRoute() {
             </Card.Content>
           </Card>
         ) : null}
-        <Card>
+        <Card
+          onLayout={(event) => {
+            detailsOffsetRef.current = event.nativeEvent.layout.y;
+          }}
+        >
           <Card.Content style={styles.cardContent}>
             <Text variant="titleMedium">Confirm incident details</Text>
             <Text variant="bodySmall">
@@ -2210,6 +2388,7 @@ export default function IncidentDraftRoute() {
                 updateLocalFieldValue(locationFieldId, value);
                 setGpsLocation(null);
                 setLocationError(null);
+                setLocationSettingsRequired(false);
                 markFieldDirty(
                   locationFieldId,
                   gpsLocation !== null || (formatLocation(draft.location) ?? '') !== value.trim(),
@@ -2231,6 +2410,19 @@ export default function IncidentDraftRoute() {
               </Button>
             ) : null}
             {locationError ? <HelperText type="error" visible>{locationError}</HelperText> : null}
+            {locationSettingsRequired && !readOnly ? (
+              <Button
+                mode="text"
+                icon="cog-outline"
+                onPress={() => {
+                  void Linking.openSettings().catch((error) => {
+                    setLocationError(errorMessage(error, 'Could not open location settings.'));
+                  });
+                }}
+              >
+                Open location settings
+              </Button>
+            ) : null}
             <Text variant="bodySmall">
               {gpsLocation
                 ? 'Current GPS location is selected but has not been saved.'
@@ -2481,24 +2673,62 @@ export default function IncidentDraftRoute() {
             ) : null}
           </Card.Content>
         </Card>
-        <Card>
+        <Card
+          onLayout={(event) => {
+            evidenceOffsetRef.current = event.nativeEvent.layout.y;
+          }}
+        >
           <Card.Content style={styles.cardContent}>
-            <Text variant="titleMedium">Incident photos and evidence</Text>
+            <Text variant="titleMedium">Photos and evidence</Text>
             <Text variant="bodySmall">
-              Capture clear photos of the scene, vehicle or property damage, or injury when applicable. Uploads are private to this report; server requirements determine whether a photo is required.
+              Add clear JPEG, PNG, or WebP photos of the scene, vehicle or property damage, or injury when applicable. Files access is limited to items you choose; uploads stay private to this report.
             </Text>
             {!readOnly ? (
-              <Button
-                mode="contained"
-                onPress={() => void captureIncidentPhoto()}
-                disabled={photoBusy || controlsDisabled}
-                loading={photoBusy}
+              <Menu
+                visible={evidenceMenuVisible}
+                onDismiss={() => setEvidenceMenuVisible(false)}
+                anchor={(
+                  <Button
+                    mode="contained"
+                    icon="camera-plus-outline"
+                    onPress={() => setEvidenceMenuVisible(true)}
+                    disabled={photoBusy || controlsDisabled}
+                    loading={photoBusy}
+                  >
+                    Add a photo
+                  </Button>
+                )}
               >
-                Capture incident photo
-              </Button>
+                <Menu.Item
+                  leadingIcon="camera-outline"
+                  title="Take a photo"
+                  onPress={() => {
+                    setEvidenceMenuVisible(false);
+                    void captureIncidentPhoto();
+                  }}
+                />
+                <Menu.Item
+                  leadingIcon="file-image-outline"
+                  title="Choose image from Files"
+                  onPress={() => void chooseIncidentImageFile()}
+                />
+              </Menu>
             ) : null}
             {photoBusy ? <ProgressBar indeterminate /> : null}
             {photoError ? <HelperText type="error" visible>{photoError}</HelperText> : null}
+            {cameraSettingsRequired && !readOnly ? (
+              <Button
+                mode="text"
+                icon="cog-outline"
+                onPress={() => {
+                  void Linking.openSettings().catch((error) => {
+                    setPhotoError(errorMessage(error, 'Could not open camera settings.'));
+                  });
+                }}
+              >
+                Open camera settings
+              </Button>
+            ) : null}
             {!draft.evidence.length ? (
               <Text variant="bodyMedium">No incident evidence has been uploaded.</Text>
             ) : null}
@@ -2551,92 +2781,17 @@ export default function IncidentDraftRoute() {
         </Card>
         <Card>
           <Card.Content style={styles.cardContent}>
-            <Text variant="titleMedium">Report preview</Text>
+            <Text variant="titleMedium">Review your report</Text>
             <Text variant="bodySmall">
-              Preview saved details and answers at any time. Unfilled fields are omitted, and the server remains the source of submission requirements.
+              Check saved details, answers, and photos before continuing. You can return to any answer to make a correction.
             </Text>
             <Button
-              mode="outlined"
-              icon={previewVisible ? 'eye-off-outline' : 'eye-outline'}
-              accessibilityState={{ expanded: previewVisible }}
-              onPress={() => setPreviewVisible((visible) => !visible)}
+              mode="contained"
+              icon="file-eye-outline"
+              onPress={() => setPreviewVisible(true)}
             >
-              {previewVisible ? 'Hide report preview' : 'Preview saved answers'}
+              Check your report
             </Button>
-            {previewVisible ? (
-              <View style={styles.previewContainer}>
-                <Text variant="titleSmall">Incident details</Text>
-                <View style={styles.previewAnswer}>
-                  <Text variant="labelLarge">Occurred at</Text>
-                  <Text variant="bodyMedium">
-                    {formatDateControlValue(draft.occurredAt, 'datetime') ?? 'Not provided'}
-                  </Text>
-                </View>
-                <View style={styles.previewAnswer}>
-                  <Text variant="labelLarge">Location</Text>
-                  <Text variant="bodyMedium">{formatLocation(draft.location) ?? 'Not provided'}</Text>
-                </View>
-                {draft.forms
-                  .filter((form) => form.activationStatus === 'triggered')
-                  .map((form) => {
-                    const formAnswers = draft.answers.filter((answer) => answer.formKey === form.formKey);
-                    const expanded = expandedPreviewForms[form.formKey] ?? false;
-                    return (
-                      <List.Accordion
-                        key={`preview:${form.formKey}`}
-                        title={formTitle(form)}
-                        description={`${formAnswers.length} saved answers`}
-                        expanded={expanded}
-                        onPress={() => setExpandedPreviewForms((current) => ({
-                          ...current,
-                          [form.formKey]: !expanded,
-                        }))}
-                        left={(props) => <List.Icon {...props} icon="file-document-outline" />}
-                        style={styles.previewAccordion}
-                      >
-                        {formAnswers.length ? formAnswers.map((answer) => {
-                          const field = findAnswerField(
-                            draft,
-                            answer.formKey,
-                            answer.fieldKey,
-                            answer.groupInstanceId,
-                          );
-                          return (
-                            <View key={answerIdentity(answer)} style={styles.previewAnswer}>
-                              <Text variant="labelLarge">
-                                {field ? getFieldPrompt(field) : answer.fieldKey}
-                              </Text>
-                              <Text variant="bodyMedium">
-                                {field ? displayAnswer(field, answer.value) : 'Saved response'}
-                              </Text>
-                              <Text variant="bodySmall">
-                                {`${answerStateLabel(answer.answerState)} · ${answer.source}`}
-                              </Text>
-                            </View>
-                          );
-                        }) : (
-                          <HelperText type="info" visible>No form answers have been saved.</HelperText>
-                        )}
-                        {!readOnly ? (
-                          <Button
-                            mode="outlined"
-                            icon="pencil-outline"
-                            onPress={() => {
-                              setExpandedForms((current) => ({ ...current, [form.formKey]: true }));
-                              scrollRef.current?.scrollTo({
-                                y: formOffsetsRef.current[form.formKey] ?? 0,
-                                animated: true,
-                              });
-                            }}
-                          >
-                            {`Edit ${formTitle(form)}`}
-                          </Button>
-                        ) : null}
-                      </List.Accordion>
-                    );
-                  })}
-              </View>
-            ) : null}
           </Card.Content>
         </Card>
         {(interviewComplete || readOnly) ? (
@@ -2735,22 +2890,10 @@ export default function IncidentDraftRoute() {
                   <Button
                     mode="contained"
                     onPress={() => void submitReport()}
-                    disabled={
-                      submitting
-                      || !interviewComplete
-                      || needsRefresh
-                      || readinessLoading
-                      || Object.values(dirtyFieldsRef.current).some(Boolean)
-                      || cacheConflict !== null
-                      || editCacheConflict.kind === 'conflict'
-                      || (
-                        !pendingSubmission
-                        && (readinessVersion !== draft.version || submitIssues.length > 0)
-                      )
-                    }
+                    disabled={submissionDisabled}
                     loading={submitting}
                   >
-                    {pendingSubmission ? 'Retry submission' : 'Confirm on this device & submit'}
+                    {submissionLabel}
                   </Button>
                 </>
               ) : (
@@ -2809,7 +2952,9 @@ export default function IncidentDraftRoute() {
             </Card.Content>
           </Card>
         ) : null}
-        {draft.forms.map((form) => {
+        {draft.forms
+          .filter((form) => form.formKey === selectedForm?.formKey)
+          .map((form) => {
           const isActive = form.activationStatus === 'triggered';
           const fields = form.definition?.fields ?? [];
           const scalarFields = fields.filter((field) => field.groupKey === null);
@@ -2817,7 +2962,8 @@ export default function IncidentDraftRoute() {
           const formUnsavedCount = Object.entries(dirtyFields).filter(([fieldId, dirty]) => {
             return dirty && parseAnswerFieldId(fieldId)?.[0] === form.formKey;
           }).length;
-          const expanded = expandedForms[form.formKey] ?? false;
+          const expanded = expandedForms[form.formKey]
+            ?? (isActive && selectedForm?.formKey === form.formKey);
           const sections = new Map<string, FormFieldDefinition[]>();
           for (const field of scalarFields) {
             const section = field.section?.trim() || 'Other details';
@@ -2830,7 +2976,7 @@ export default function IncidentDraftRoute() {
             <Card
               key={`${form.formKey}:${form.version}`}
               onLayout={(event) => {
-                formOffsetsRef.current[form.formKey] = event.nativeEvent.layout.y;
+                formSectionOffsetRef.current = event.nativeEvent.layout.y;
               }}
             >
               <Card.Content style={styles.cardContent}>
@@ -3126,6 +3272,247 @@ export default function IncidentDraftRoute() {
           {backLabel}
         </Button>
       </ScrollView>
+      <Modal
+        visible={previewVisible}
+        animationType="slide"
+        presentationStyle="fullScreen"
+        onRequestClose={() => setPreviewVisible(false)}
+      >
+        <SafeAreaView style={styles.reviewSafeArea}>
+          <View style={styles.reviewHeader}>
+            <Button
+              mode="text"
+              icon="arrow-left"
+              accessibilityLabel="Back to incident form"
+              onPress={() => setPreviewVisible(false)}
+            >
+              Back
+            </Button>
+            <Text variant="titleLarge" style={styles.reviewTitle}>Check your report</Text>
+          </View>
+          <ScrollView
+            contentContainerStyle={styles.reviewContent}
+            keyboardShouldPersistTaps="handled"
+          >
+            <Text variant="bodyMedium">
+              Review the information saved to this report. Tap an answer to correct it.
+            </Text>
+            {Object.values(dirtyFields).some(Boolean) ? (
+              <Card style={styles.reviewWarning}>
+                <Card.Content style={styles.cardContent}>
+                  <Text variant="titleSmall">Unsaved changes</Text>
+                  <Text variant="bodyMedium">
+                    Unsaved edits are not included below. Save them before submitting.
+                  </Text>
+                  <Button mode="outlined" onPress={() => setPreviewVisible(false)}>
+                    Return to editing
+                  </Button>
+                </Card.Content>
+              </Card>
+            ) : null}
+            <Card>
+              <Card.Content style={styles.cardContent}>
+                <View style={styles.reviewSectionHeader}>
+                  <Text variant="titleMedium">Incident details</Text>
+                  {!readOnly ? (
+                    <Button
+                      mode="text"
+                      icon="pencil-outline"
+                      contentStyle={styles.reviewEditButtonContent}
+                      onPress={() => openReviewSection(detailsOffsetRef.current)}
+                    >
+                      Edit
+                    </Button>
+                  ) : null}
+                </View>
+                <View style={styles.previewAnswer}>
+                  <Text variant="labelLarge">Date and time</Text>
+                  <Text variant="bodyMedium">
+                    {formatDateControlValue(draft.occurredAt, 'datetime') ?? 'Not provided'}
+                  </Text>
+                </View>
+                <View style={styles.previewAnswer}>
+                  <Text variant="labelLarge">Location</Text>
+                  <Text variant="bodyMedium">{formatLocation(draft.location) ?? 'Not provided'}</Text>
+                </View>
+              </Card.Content>
+            </Card>
+            {draft.forms
+              .filter((form) => form.activationStatus === 'triggered')
+              .map((form) => {
+                const formAnswers = draft.answers.filter((answer) => answer.formKey === form.formKey);
+                return (
+                  <Card key={`review:${form.formKey}:${form.version}`}>
+                    <Card.Content style={styles.cardContent}>
+                      <View style={styles.reviewSectionHeader}>
+                        <View style={styles.reviewHeading}>
+                          <Text variant="titleMedium">{formTitle(form)}</Text>
+                          <Text variant="bodySmall">
+                            {`${formAnswers.length} saved answer${formAnswers.length === 1 ? '' : 's'} · pinned v${form.version}`}
+                          </Text>
+                        </View>
+                        {!readOnly ? (
+                          <Button
+                            mode="text"
+                            icon="pencil-outline"
+                            contentStyle={styles.reviewEditButtonContent}
+                            onPress={() => {
+                              setPreviewVisible(false);
+                              selectForm(form);
+                            }}
+                          >
+                            Edit
+                          </Button>
+                        ) : null}
+                      </View>
+                      {formAnswers.length ? formAnswers.map((answer) => {
+                        const field = findAnswerField(
+                          draft,
+                          answer.formKey,
+                          answer.fieldKey,
+                          answer.groupInstanceId,
+                        );
+                        const prompt = field ? getFieldPrompt(field) : answer.fieldKey;
+                        const value = field ? displayAnswer(field, answer.value) : 'Saved response';
+                        return (
+                          <Pressable
+                            key={answerIdentity(answer)}
+                            accessibilityRole={readOnly ? undefined : 'button'}
+                            accessibilityLabel={`${prompt}: ${value}${readOnly ? '' : ', edit answer'}`}
+                            disabled={readOnly}
+                            onPress={() => openReviewSection(historyOffsetRef.current, answer)}
+                            style={({ pressed }) => [
+                              styles.reviewAnswer,
+                              pressed && styles.reviewAnswerPressed,
+                            ]}
+                          >
+                            <Text variant="labelLarge">{prompt}</Text>
+                            <Text variant="bodyMedium">{value}</Text>
+                            <Text variant="bodySmall">
+                              {`${answerStateLabel(answer.answerState)} · ${answer.source}`}
+                            </Text>
+                          </Pressable>
+                        );
+                      }) : (
+                        <HelperText type="info" visible>No saved answers for this form yet.</HelperText>
+                      )}
+                    </Card.Content>
+                  </Card>
+                );
+              })}
+            <Card>
+              <Card.Content style={styles.cardContent}>
+                <View style={styles.reviewSectionHeader}>
+                  <View style={styles.reviewHeading}>
+                    <Text variant="titleMedium">Photos and evidence</Text>
+                    <Text variant="bodySmall">
+                      {`${draft.evidence.length} item${draft.evidence.length === 1 ? '' : 's'} attached to this report`}
+                    </Text>
+                  </View>
+                  {!readOnly ? (
+                    <Button
+                      mode="text"
+                      icon="pencil-outline"
+                      contentStyle={styles.reviewEditButtonContent}
+                      onPress={() => openReviewSection(evidenceOffsetRef.current)}
+                    >
+                      Edit
+                    </Button>
+                  ) : null}
+                </View>
+                {draft.evidence.length ? draft.evidence.map((evidence) => {
+                  const status = photoUploads[evidence.id]?.status ?? evidence.uploadStatus;
+                  return (
+                    <Pressable
+                      key={`review:evidence:${evidence.id}`}
+                      accessibilityRole="button"
+                      accessibilityLabel={`${evidence.description?.trim() || 'Incident photo'}, ${status}. View evidence`}
+                      onPress={() => openReviewSection(evidenceOffsetRef.current)}
+                      style={({ pressed }) => [
+                        styles.reviewEvidence,
+                        pressed && styles.reviewAnswerPressed,
+                      ]}
+                    >
+                      {evidence.signedUrl ? (
+                        <Image
+                          source={{ uri: evidence.signedUrl }}
+                          accessibilityLabel={evidence.description?.trim() || 'Uploaded incident photo'}
+                          resizeMode="cover"
+                          style={styles.reviewEvidenceImage}
+                        />
+                      ) : null}
+                      <View style={styles.reviewHeading}>
+                        <Text variant="labelLarge">
+                          {evidence.description?.trim() || 'Incident photo'}
+                        </Text>
+                        <Text variant="bodySmall">
+                          {`${evidence.mediaType} · ${Math.ceil(evidence.sizeBytes / 1024)} KB · ${status}`}
+                        </Text>
+                      </View>
+                      <List.Icon icon="chevron-right" />
+                    </Pressable>
+                  );
+                }) : (
+                  <Text variant="bodyMedium">No photos have been added to this report.</Text>
+                )}
+              </Card.Content>
+            </Card>
+            {submitIssues.length ? (
+              <Card style={styles.reviewWarning}>
+                <Card.Content style={styles.cardContent}>
+                  <Text variant="titleSmall">Needs attention</Text>
+                  {submitIssues.map((issue, index) => (
+                    <Text
+                      key={`review:issue:${issue.formKey}:${issue.fieldKey}:${index}`}
+                      variant="bodyMedium"
+                    >
+                      {`${issueLabel(issue, draft)}: ${issue.message ?? 'Complete this server-required item before submitting.'}`}
+                    </Text>
+                  ))}
+                </Card.Content>
+              </Card>
+            ) : readinessVersion !== draft.version ? (
+              <HelperText type="info" visible>
+                Check server readiness on the form before submitting this revision.
+              </HelperText>
+            ) : null}
+          </ScrollView>
+          <View style={styles.reviewFooter}>
+            {!readOnly ? (
+              <>
+                <Button
+                  mode="outlined"
+                  style={styles.reviewFooterButton}
+                  onPress={() => setPreviewVisible(false)}
+                >
+                  Back to form
+                </Button>
+                <Button
+                  mode="contained"
+                  icon="check"
+                  style={styles.reviewSubmitButton}
+                  disabled={submissionDisabled}
+                  loading={submitting}
+                  onPress={() => {
+                    setPreviewVisible(false);
+                    setTimeout(() => void submitReport(), 0);
+                  }}
+                >
+                  {reviewSubmissionLabel}
+                </Button>
+              </>
+            ) : (
+              <Button
+                mode="contained"
+                style={styles.reviewFooterButton}
+                onPress={() => setPreviewVisible(false)}
+              >
+                Close review
+              </Button>
+            )}
+          </View>
+        </SafeAreaView>
+      </Modal>
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
@@ -3161,6 +3548,39 @@ const styles = StyleSheet.create({
     maxWidth: 760,
     minHeight: 56,
     width: '100%',
+  },
+  formTabs: {
+    gap: 8,
+    paddingBottom: 10,
+    paddingRight: 20,
+  },
+  formTab: {
+    backgroundColor: palette.surfaceVariant,
+    borderColor: palette.border,
+    borderRadius: 14,
+    borderWidth: StyleSheet.hairlineWidth,
+    gap: 4,
+    justifyContent: 'center',
+    minHeight: 56,
+    minWidth: 96,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  formTabSelected: {
+    backgroundColor: palette.primaryContainer,
+    borderColor: palette.primary,
+  },
+  formTabPressed: {
+    opacity: 0.75,
+  },
+  formTabLabel: {
+    color: palette.text,
+  },
+  formTabLabelSelected: {
+    color: palette.primary,
+  },
+  formTabMeta: {
+    color: palette.mutedText,
   },
   revisionLabel: {
     color: palette.mutedText,
@@ -3309,22 +3729,94 @@ const styles = StyleSheet.create({
     flex: 1,
     flexShrink: 1,
   },
-  previewContainer: {
-    borderTopColor: palette.border,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    gap: 8,
-    paddingTop: 12,
-  },
-  previewAccordion: {
-    backgroundColor: palette.surfaceVariant,
-    borderRadius: 12,
-    overflow: 'hidden',
-  },
   previewAnswer: {
     borderBottomColor: palette.border,
     borderBottomWidth: StyleSheet.hairlineWidth,
     gap: 4,
     paddingVertical: 8,
+  },
+  reviewSafeArea: {
+    backgroundColor: palette.background,
+    flex: 1,
+  },
+  reviewHeader: {
+    alignItems: 'center',
+    backgroundColor: palette.surface,
+    borderBottomColor: palette.border,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    minHeight: 60,
+    paddingHorizontal: 12,
+  },
+  reviewTitle: {
+    flex: 1,
+    paddingRight: 52,
+    textAlign: 'center',
+  },
+  reviewContent: {
+    alignSelf: 'center',
+    gap: 12,
+    maxWidth: 760,
+    padding: 16,
+    paddingBottom: 24,
+    width: '100%',
+  },
+  reviewWarning: {
+    backgroundColor: palette.surfaceVariant,
+  },
+  reviewSectionHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 8,
+    justifyContent: 'space-between',
+  },
+  reviewHeading: {
+    flex: 1,
+    gap: 4,
+  },
+  reviewEditButtonContent: {
+    minHeight: 44,
+  },
+  reviewAnswer: {
+    borderBottomColor: palette.border,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    gap: 4,
+    minHeight: 52,
+    paddingVertical: 12,
+  },
+  reviewAnswerPressed: {
+    opacity: 0.72,
+  },
+  reviewEvidence: {
+    alignItems: 'center',
+    borderTopColor: palette.border,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    gap: 12,
+    minHeight: 76,
+    paddingVertical: 8,
+  },
+  reviewEvidenceImage: {
+    borderRadius: 10,
+    height: 64,
+    width: 64,
+  },
+  reviewFooter: {
+    backgroundColor: palette.surface,
+    borderTopColor: palette.border,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    flexDirection: 'row',
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+  },
+  reviewFooterButton: {
+    flex: 1,
+    minHeight: 48,
+  },
+  reviewSubmitButton: {
+    flex: 1.25,
+    minHeight: 48,
   },
   choiceRow: {
     flexDirection: 'row',

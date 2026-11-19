@@ -80,10 +80,11 @@ export default function DriverTabsLayout() {
         headerShown: false,
         tabBarActiveTintColor: palette.primary,
         tabBarInactiveTintColor: palette.mutedText,
-        tabBarLabelStyle: { fontSize: 12, fontWeight: '600' },
+        tabBarLabelStyle: { fontSize: 12, fontWeight: '500' },
         tabBarStyle: {
           backgroundColor: palette.surface,
           borderTopColor: palette.border,
+          paddingTop: 6,
         },
       }}
     >
@@ -102,13 +103,13 @@ export default function DriverTabsLayout() {
         }}
       />
       <Tabs.Screen
-        name="incidents"
+        name="files"
         options={{
-          title: 'Incidents',
-          tabBarLabel: 'Incidents',
+          title: 'Files',
+          tabBarLabel: 'Files',
           tabBarIcon: ({ color, size }) => (
             <MaterialCommunityIcons
-              name="clipboard-text-outline"
+              name="folder-outline"
               color={typeof color === 'string' ? color : palette.mutedText}
               size={size}
             />
@@ -119,10 +120,17 @@ export default function DriverTabsLayout() {
         name="profile"
         options={{
           title: 'Profile',
-          tabBarLabel: 'Profile',
+          href: null,
+        }}
+      />
+      <Tabs.Screen
+        name="incidents"
+        options={{
+          title: 'Incidents',
+          tabBarLabel: 'Incidents',
           tabBarIcon: ({ color, size }) => (
             <MaterialCommunityIcons
-              name="account-circle-outline"
+              name="alert-outline"
               color={typeof color === 'string' ? color : palette.mutedText}
               size={size}
             />

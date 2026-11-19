@@ -18,12 +18,12 @@ Audit date: 2026-11-19
 | Distinct question-level branch expressions | **16**, plus one photo-screen shot-list condition = documented **17** total `show_if` expressions |
 | Interview prompts reached in mockup | **16**; no full graph traversal |
 | Branches fully verified | **0**; four behavior families were entered, with mismatches and/or incomplete branch coverage |
-| Mobile route source status | Auth/profile, Home, Incidents, and narrative draft save/resume routes implemented; full interview and evidence/review flows remain missing |
+| Mobile route source status | Auth/profile, Home, Files, Incidents, driver-file upload, and narrative draft routes implemented; full interview and evidence/review flows remain missing |
 | Seeded driver Auth | **PASS**: hosted password grant returns a session; JS client storage test restores the same user |
 | Mobile runtime status | **PARTIAL/BLOCKED**: corrected dev bundle reached the profile gate; hosted profile query fails because columns from checked-in migrations are absent |
 | Edge Functions | Submit function implemented; process turn and select question return 501 |
 | Confirmed mockup discrepancies | **11** grouped issues in report 08; additional source gaps listed separately |
-| Mobile focused tests | **13 passed** |
+| Mobile focused tests | **32 passed** |
 | Mobile typecheck | **PASS** |
 | Expo web export | **PASS** |
 | Database tests | 53 existing assertions and 14 Phase 1 assertions defined, **not run** |
@@ -43,6 +43,12 @@ Audit date: 2026-11-19
 - **MOBILE**: The prior bundle reported `fetch failed` for `10.0.2.2:55421`. Starting Expo with Infisical `dev` produced a bundle containing the hosted dev URL and excluding the local URL. ADB resolved and pinged the hosted endpoint; the app reached the profile gate.
 - **BLOCKED**: Hosted profile reads fail with SQLSTATE `42703`: `employee_id` and `profile_completed_at` are absent. The checked-in migration adds both; no hosted migration was applied. Remote migration status is blocked because this network cannot reach the project's direct IPv6 DB endpoint; the `SUPABASE_DB_URL` secret is not a valid Postgres pooler URI.
 - **MOBILE/BLOCKED**: Android MCP initialization failed. A Play Store/system ANR then prevented reliable emulator screenshots.
+
+## Follow-up mobile source update
+
+- **SOURCE**: Home now matches the driver dashboard structure, retains live trip and incident-draft behavior, and links to the Home/Files/Incidents tabs. Files uses the existing owner-checked metadata RPCs and private `driver-files` bucket for PDFs and walk-around photos.
+- **TEST**: `npm run mobile:typecheck` passed; `npm --prefix apps/mobile test` passed all 32 focused tests; Expo web bundled successfully.
+- **BLOCKED**: The local browser remained on the protected sign-in screen, so no authenticated Home/Files interaction or device camera/biometric runtime test was performed. Hosted profile schema drift and the Android emulator issue noted above remain unresolved.
 - **BLOCKED**: Docker Desktop engine was unavailable. The local Supabase stack was not started, reset, or queried; `supabase test db` and `scripts/test-local-submit.ps1` were not run.
 
 ## Existing automated coverage (source only)

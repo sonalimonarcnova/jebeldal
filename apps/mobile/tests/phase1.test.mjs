@@ -42,6 +42,12 @@ import {
   resolveCachedDraftEdits,
 } from '../src/features/incidents/draftEditCache.ts';
 import { mapHomeTrip } from '../src/features/home/model.ts';
+import {
+  countUploadedCategories,
+  mapDriverFiles,
+  setupDocumentCategories,
+  walkaroundPhotoCategories,
+} from '../src/features/files/model.ts';
 
 const incidentId = '10000000-0000-4000-8000-000000000001';
 const revisionId = '20000000-0000-4000-8000-000000000001';
@@ -81,6 +87,45 @@ test('driver navigation waits for auth/profile and protects incomplete or non-dr
     resolveDriverRoute({ ...defaults, profile: { ...profile, profileCompletedAt: '2026-11-19T00:00:00Z' } }),
     'home',
   );
+});
+
+test('driver file categories count only successfully uploaded setup items', () => {
+  const files = mapDriverFiles([
+    {
+      id: '10000000-0000-4000-8000-000000000001',
+      category: 'cdl_front',
+      object_path: 'org/user/file-one',
+      media_type: 'document',
+      size_bytes: 1200,
+      captured_at: null,
+      upload_status: 'uploaded',
+      created_at: '2026-11-19T10:00:00Z',
+    },
+    {
+      id: '10000000-0000-4000-8000-000000000002',
+      category: 'cdl_front',
+      object_path: 'org/user/file-two',
+      media_type: 'document',
+      size_bytes: 1200,
+      captured_at: null,
+      upload_status: 'failed',
+      created_at: '2026-11-19T10:01:00Z',
+    },
+    {
+      id: '10000000-0000-4000-8000-000000000003',
+      category: 'walkaround_front',
+      object_path: 'org/user/photo-one',
+      media_type: 'image',
+      size_bytes: 1200,
+      captured_at: '2026-11-19T10:02:00Z',
+      upload_status: 'uploaded',
+      created_at: '2026-11-19T10:02:00Z',
+    },
+  ]);
+
+  assert.equal(countUploadedCategories(files, setupDocumentCategories), 1);
+  assert.equal(countUploadedCategories(files, walkaroundPhotoCategories), 1);
+  assert.throws(() => mapDriverFiles([{ category: 'unknown' }]), /invalid/i);
 });
 
 test('incident cards use the active revision, confirmed summary, and triggered forms', () => {
