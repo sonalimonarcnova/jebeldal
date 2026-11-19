@@ -34,7 +34,7 @@
         {
           "cameraPermission": "Allow JebelDAL to capture incident photos.",
           "photosPermission": false,
-          "microphonePermission": false
+          "microphonePermission": "JebelDAL records your answers when you report an incident."
         }
       ],
       [
@@ -48,6 +48,12 @@
         "expo-location",
         {
           "locationWhenInUsePermission": "Allow JebelDAL to add your current location to an incident report when you choose."
+        }
+      ],
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "JebelDAL records your answers when you report an incident."
         }
       ]
     ]
