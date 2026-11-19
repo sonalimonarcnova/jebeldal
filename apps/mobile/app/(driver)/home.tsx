@@ -1,13 +1,15 @@
 import { router, useFocusEffect } from 'expo-router';
 import { useCallback, useState } from 'react';
 import { ScrollView, StyleSheet, View } from 'react-native';
-import { ActivityIndicator, Avatar, Button, Card, HelperText, Text } from 'react-native-paper';
+import { ActivityIndicator, Avatar, Card, HelperText, Text } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { useAuth } from '../../src/auth/AuthProvider';
 import { createIncidentDraft } from '../../src/features/incidents/repository';
 import { loadLatestHomeTrip } from '../../src/features/home/repository';
 import type { HomeTrip } from '../../src/features/home/model';
+import { AppButton as Button } from '../../src/ui/AppButton';
+import { palette } from '../../src/ui/theme';
 
 function formatTripDate(value: string | null): string {
   if (!value) {
@@ -55,7 +57,10 @@ export default function HomeRoute() {
     setCreateError(null);
     try {
       const revisionId = await createIncidentDraft();
-      router.push({ pathname: '/incident/[revisionId]', params: { revisionId } });
+      router.push({
+        pathname: '/incident/[revisionId]',
+        params: { revisionId, returnTo: 'home' },
+      });
     } catch (error) {
       setCreateError(error instanceof Error ? error.message : 'Could not create an incident draft.');
     } finally {
@@ -74,27 +79,28 @@ export default function HomeRoute() {
           <Button
             mode="outlined"
             compact
+            icon="account-outline"
             accessibilityLabel="Open profile"
-            onPress={() => router.push('/(driver)/profile')}
+            onPress={() => router.navigate('/(driver)/profile')}
           >
             Profile
           </Button>
         </View>
 
-        <Card>
+        <Card style={styles.card}>
           <Card.Content style={styles.score}>
-            <Avatar.Text size={56} label="92" />
+            <Avatar.Text size={56} label="92" style={styles.scoreBadge} />
             <View style={styles.flex}>
               <Text variant="titleMedium">Driving score</Text>
-              <Text variant="bodyMedium">Demo display data</Text>
+              <Text variant="bodyMedium" style={styles.scoreLabel}>Sample score</Text>
               <Text variant="bodySmall" style={styles.secondary}>
-                This score is sample data, not a live fleet signal.
+                Sample only · not a live fleet signal.
               </Text>
             </View>
           </Card.Content>
         </Card>
 
-        <Card>
+        <Card style={styles.card}>
           <Card.Content style={styles.section}>
             <Text variant="titleMedium">Today</Text>
             {loadingTrip ? (
@@ -124,7 +130,7 @@ export default function HomeRoute() {
         </Card>
 
         {trip?.preTripStatus ? (
-          <Card>
+          <Card style={styles.card}>
             <Card.Content style={styles.section}>
               <Text variant="titleMedium">Pre-trip inspection</Text>
               <Text variant="bodyMedium">{trip.preTripStatus}</Text>
@@ -140,6 +146,7 @@ export default function HomeRoute() {
           <Button
             mode="contained"
             icon="plus"
+            accessibilityLabel="File an incident report"
             onPress={() => void startIncident()}
             disabled={creating}
             loading={creating}
@@ -149,7 +156,7 @@ export default function HomeRoute() {
           </Button>
           <Button
             mode="outlined"
-            onPress={() => router.push('/(driver)/incidents')}
+            onPress={() => router.navigate('/(driver)/incidents')}
             contentStyle={styles.actionButton}
           >
             View incidents
@@ -164,11 +171,14 @@ export default function HomeRoute() {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: '#F7F8FB',
+    backgroundColor: palette.background,
   },
   content: {
     gap: 16,
     padding: 20,
+    width: '100%',
+    maxWidth: 720,
+    alignSelf: 'center',
   },
   header: {
     alignItems: 'center',
@@ -179,6 +189,20 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     flexDirection: 'row',
     gap: 16,
+    padding: 20,
+  },
+  scoreBadge: {
+    backgroundColor: palette.primaryContainer,
+  },
+  scoreLabel: {
+    color: palette.primary,
+    fontWeight: '600',
+  },
+  card: {
+    backgroundColor: palette.surface,
+    borderColor: palette.border,
+    borderRadius: 18,
+    borderWidth: StyleSheet.hairlineWidth,
   },
   flex: {
     flex: 1,
@@ -187,7 +211,7 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   secondary: {
-    color: '#58606E',
+    color: palette.mutedText,
   },
   actionButton: {
     minHeight: 48,

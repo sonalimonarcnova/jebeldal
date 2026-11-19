@@ -2,22 +2,25 @@ import { router, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Alert,
+  KeyboardAvoidingView,
   Image,
   Platform,
+  Pressable,
   ScrollView,
   StyleSheet,
   View,
   type ScrollViewInstance,
 } from 'react-native';
+import DateTimePicker, { type DateTimePickerEvent } from '@react-native-community/datetimepicker';
 import * as ImagePicker from 'expo-image-picker';
+import * as Location from 'expo-location';
 import * as LocalAuthentication from 'expo-local-authentication';
 import {
   ActivityIndicator,
-  Button,
   Card,
-  Checkbox,
   Chip,
   HelperText,
+  List,
   Menu,
   ProgressBar,
   SegmentedButtons,
@@ -89,6 +92,8 @@ import {
   type PendingSubmission,
 } from '../../src/features/incidents/submissionCache';
 import type { SubmitIssue } from '../../src/features/incidents/rpcOperations';
+import { AppButton as Button } from '../../src/ui/AppButton';
+import { palette } from '../../src/ui/theme';
 
 type FieldValues = Record<string, unknown>;
 type DirtyFields = Record<string, boolean>;
@@ -141,6 +146,38 @@ function toLocalDateTimeInput(value: string | null): string {
   if (Number.isNaN(date.getTime())) return value;
   const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
   return local.toISOString().slice(0, 16);
+}
+
+type DateControlType = 'date' | 'datetime';
+
+function parseDateControlValue(value: unknown, type: DateControlType): Date | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  if (type === 'date') {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    if (!match) return null;
+    const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 12);
+    return date.getFullYear() === Number(match[1])
+      && date.getMonth() === Number(match[2]) - 1
+      && date.getDate() === Number(match[3])
+      ? date
+      : null;
+  }
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function toLocalDateValue(date: Date): string {
+  const pad = (part: number) => String(part).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function formatDateControlValue(value: unknown, type: DateControlType): string | null {
+  const date = parseDateControlValue(value, type);
+  if (!date) return null;
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    ...(type === 'datetime' ? { timeStyle: 'short' as const } : {}),
+  }).format(date);
 }
 
 function answerIdentity(answer: IncidentAnswer): string {
@@ -258,6 +295,9 @@ function displayAnswer(field: FormFieldDefinition, value: unknown): string {
   if (value === null || value === undefined || value === '') {
     return 'No answer saved.';
   }
+  if (field.type === 'date' || field.type === 'datetime') {
+    return formatDateControlValue(value, field.type) ?? String(value);
+  }
   if (typeof value === 'boolean') {
     return value ? 'Yes' : 'No';
   }
@@ -336,6 +376,116 @@ function EnumFieldEditor({
   );
 }
 
+function DateTimeFieldEditor({
+  label,
+  type,
+  value,
+  onChange,
+  disabled,
+}: {
+  label: string;
+  type: DateControlType;
+  value: unknown;
+  onChange: (value: string) => void;
+  disabled: boolean;
+}) {
+  const parsedValue = parseDateControlValue(value, type);
+  const [pickerMode, setPickerMode] = useState<'date' | 'time' | null>(null);
+  const [selectedDate, setSelectedDate] = useState<Date | null>(parsedValue);
+  const [selectedTime, setSelectedTime] = useState<Date | null>(parsedValue);
+
+  useEffect(() => {
+    setSelectedDate(parsedValue);
+    setSelectedTime(parsedValue);
+  }, [value, type]);
+
+  const handlePickerChange = (event: DateTimePickerEvent, pickedDate?: Date) => {
+    const mode = pickerMode;
+    setPickerMode(null);
+    if (event.type !== 'set' || !pickedDate || !mode) return;
+
+    if (type === 'date') {
+      setSelectedDate(pickedDate);
+      onChange(toLocalDateValue(pickedDate));
+      return;
+    }
+
+    if (mode === 'date') {
+      setSelectedDate(pickedDate);
+      const time = selectedTime;
+      if (time) {
+        const combined = new Date(pickedDate);
+        combined.setHours(time.getHours(), time.getMinutes(), 0, 0);
+        onChange(combined.toISOString());
+      }
+      return;
+    }
+
+    setSelectedTime(pickedDate);
+    const date = selectedDate;
+    if (date) {
+      const combined = new Date(date);
+      combined.setHours(pickedDate.getHours(), pickedDate.getMinutes(), 0, 0);
+      onChange(combined.toISOString());
+    }
+  };
+
+  const dateValue = selectedDate ?? parsedValue;
+  const timeValue = selectedTime ?? parsedValue;
+  const pickerValue = pickerMode === 'time'
+    ? timeValue ?? new Date()
+    : dateValue ?? new Date();
+  const dateLabel = dateValue
+    ? formatDateControlValue(toLocalDateValue(dateValue), 'date') ?? 'Choose date'
+    : 'Choose date';
+  const timeLabel = timeValue
+    ? new Intl.DateTimeFormat(undefined, { timeStyle: 'short' }).format(timeValue)
+    : 'Choose time';
+
+  return (
+    <View style={styles.fieldControl}>
+      <Text variant="labelLarge">{label}</Text>
+      <View style={styles.dateTimeControls}>
+        <Button
+          mode="outlined"
+          icon="calendar-month"
+          accessibilityLabel={`${label}: ${dateLabel}`}
+          disabled={disabled}
+          onPress={() => setPickerMode('date')}
+          style={styles.dateTimeButton}
+          contentStyle={styles.dateTimeButtonContent}
+          labelStyle={styles.dateTimeButtonLabel}
+        >
+          {dateLabel}
+        </Button>
+        {type === 'datetime' ? (
+          <Button
+            mode="outlined"
+            icon="clock-outline"
+            accessibilityLabel={`${label}: ${timeLabel}`}
+            disabled={disabled}
+            onPress={() => setPickerMode('time')}
+            style={styles.dateTimeButton}
+            contentStyle={styles.dateTimeButtonContent}
+            labelStyle={styles.dateTimeButtonLabel}
+          >
+            {timeLabel}
+          </Button>
+        ) : null}
+      </View>
+      {pickerMode ? (
+        <DateTimePicker
+          value={pickerValue}
+          mode={pickerMode}
+          display={Platform.OS === 'ios' ? 'compact' : 'default'}
+          onChange={handlePickerChange}
+          accentColor={palette.primary}
+        />
+      ) : null}
+    </View>
+  );
+}
+
 function IncidentFieldEditor({
   field,
   value,
@@ -343,6 +493,7 @@ function IncidentFieldEditor({
   disabled,
   readOnly,
   promptOverride,
+  onBlur,
 }: {
   field: FormFieldDefinition;
   value: unknown;
@@ -350,6 +501,7 @@ function IncidentFieldEditor({
   disabled: boolean;
   readOnly: boolean;
   promptOverride?: string;
+  onBlur?: () => void;
 }) {
   const label = promptOverride ?? getFieldPrompt(field);
   if (readOnly) {
@@ -412,20 +564,52 @@ function IncidentFieldEditor({
       <View style={styles.fieldControl}>
         <Text variant="labelLarge">{label}{field.required ? ' · Required' : ''}</Text>
         <HelperText type="info" visible>Select all that apply.</HelperText>
-        {field.options.map((option) => (
-          <Checkbox.Item
+        <View style={styles.multiSelectOptions}>
+          {field.options.map((option) => {
+            const isSelected = selected.includes(option.value);
+            return (
+          <Pressable
             key={option.value}
-            label={option.label}
-            status={selected.includes(option.value) ? 'checked' : 'unchecked'}
+            accessibilityRole="checkbox"
+            accessibilityLabel={option.label}
+            accessibilityState={{ checked: isSelected, disabled }}
+            disabled={disabled}
             onPress={() => {
-              onChange(selected.includes(option.value)
+              onChange(isSelected
                 ? selected.filter((item) => item !== option.value)
                 : [...selected, option.value]);
             }}
-            disabled={disabled}
-          />
-        ))}
+            style={({ pressed }) => [
+              styles.multiSelectOption,
+              isSelected && styles.multiSelectOptionSelected,
+              disabled && styles.multiSelectOptionDisabled,
+              pressed && !disabled && styles.multiSelectOptionPressed,
+            ]}
+          >
+            <List.Icon
+              icon={isSelected ? 'checkbox-marked' : 'checkbox-blank-outline'}
+              color={isSelected ? palette.primary : palette.mutedText}
+            />
+            <Text variant="bodyMedium" style={styles.multiSelectOptionLabel}>
+              {option.label}
+            </Text>
+          </Pressable>
+            );
+          })}
+        </View>
       </View>
+    );
+  }
+
+  if (field.type === 'date' || field.type === 'datetime') {
+    return (
+      <DateTimeFieldEditor
+        label={`${label}${field.required ? ' · Required' : ''}`}
+        type={field.type}
+        value={value}
+        onChange={onChange}
+        disabled={disabled}
+      />
     );
   }
 
@@ -436,9 +620,7 @@ function IncidentFieldEditor({
       ? 'phone-pad'
       : field.type === 'email'
         ? 'email-address'
-        : field.type === 'date'
-          ? 'numbers-and-punctuation'
-          : 'default';
+        : 'default';
 
   return (
     <TextInput
@@ -449,6 +631,7 @@ function IncidentFieldEditor({
       keyboardType={keyboardType}
       value={typeof value === 'string' || typeof value === 'number' ? String(value) : ''}
       onChangeText={onChange}
+      onBlur={onBlur}
       disabled={disabled}
       maxLength={field.validation?.maxLength}
       accessibilityHint={field.required ? 'Required field' : undefined}
@@ -458,8 +641,21 @@ function IncidentFieldEditor({
 }
 
 export default function IncidentDraftRoute() {
-  const { revisionId: revisionIdParam } = useLocalSearchParams<{ revisionId: string }>();
+  const {
+    revisionId: revisionIdParam,
+    returnTo: returnToParam,
+  } = useLocalSearchParams<{ revisionId: string; returnTo?: string }>();
   const revisionId = Array.isArray(revisionIdParam) ? revisionIdParam[0] : revisionIdParam;
+  const returnTo = Array.isArray(returnToParam) ? returnToParam[0] : returnToParam;
+  const fallbackRoute = returnTo === 'home' ? '/(driver)/home' : '/(driver)/incidents';
+  const backLabel = returnTo === 'home' ? 'Back to Home' : 'Back to Incidents';
+  const handleBack = () => {
+    if (router.canGoBack()) {
+      router.back();
+    } else {
+      router.replace(fallbackRoute);
+    }
+  };
   const { session } = useAuth();
   const [draft, setDraft] = useState<IncidentDraft | null>(null);
   const [fieldValues, setFieldValues] = useState<FieldValues>({});
@@ -481,12 +677,20 @@ export default function IncidentDraftRoute() {
   const [submittingTurn, setSubmittingTurn] = useState(false);
   const [turnMessage, setTurnMessage] = useState<string | null>(null);
   const [detailMessage, setDetailMessage] = useState<string | null>(null);
+  const [locationError, setLocationError] = useState<string | null>(null);
+  const [gpsLocation, setGpsLocation] = useState<FormJsonValue | null>(null);
+  const [locationLoading, setLocationLoading] = useState(false);
   const [photoError, setPhotoError] = useState<string | null>(null);
   const [photoUploads, setPhotoUploads] = useState<Record<string, PhotoUploadState>>({});
   const [photoBusy, setPhotoBusy] = useState(false);
   const [creatingGroup, setCreatingGroup] = useState<string | null>(null);
   const [deletingGroup, setDeletingGroup] = useState<string | null>(null);
   const [historyAnswerId, setHistoryAnswerId] = useState<string | null>(null);
+  const [expandedForms, setExpandedForms] = useState<Record<string, boolean>>({});
+  const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({});
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
+  const [previewVisible, setPreviewVisible] = useState(false);
+  const [expandedPreviewForms, setExpandedPreviewForms] = useState<Record<string, boolean>>({});
   const [pendingSubmission, setPendingSubmission] = useState<PendingSubmission | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitIssues, setSubmitIssues] = useState<SubmitIssue[]>([]);
@@ -500,6 +704,7 @@ export default function IncidentDraftRoute() {
   const draftRef = useRef<IncidentDraft | null>(draft);
   const pendingTurnRef = useRef<{ questionId: string; text: string; clientTurnId: string } | null>(null);
   const scrollRef = useRef<ScrollViewInstance | null>(null);
+  const formOffsetsRef = useRef<Record<string, number>>({});
   const historyOffsetRef = useRef(0);
   const submitInFlightRef = useRef(false);
   draftRef.current = draft;
@@ -887,6 +1092,19 @@ export default function IncidentDraftRoute() {
     setSaveMessage(null);
   };
 
+  const validateEditedField = (
+    form: IncidentForm,
+    field: FormFieldDefinition,
+    groupInstanceId: string | null,
+  ) => {
+    const fieldId = answerValueId(form.formKey, field.key, groupInstanceId);
+    if (!dirtyFieldsRef.current[fieldId]) return;
+    const result = validateFieldValue(field, fieldValuesRef.current[fieldId]);
+    if (!result.ok) {
+      setFieldErrors((current) => ({ ...current, [fieldId]: result.error }));
+    }
+  };
+
   const saveField = async (
     form: IncidentForm,
     field: FormFieldDefinition,
@@ -1203,6 +1421,62 @@ export default function IncidentDraftRoute() {
     }
   };
 
+  const useCurrentLocation = async () => {
+    setLocationLoading(true);
+    setDetailMessage(null);
+    setLocationError(null);
+    try {
+      const permission = await Location.requestForegroundPermissionsAsync();
+      if (permission.status !== 'granted') {
+        setDetailMessage('Location permission was not granted. You can enter a place manually.');
+        return;
+      }
+
+      const current = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.Balanced,
+      });
+      const [address] = await Location.reverseGeocodeAsync(current.coords);
+      const addressParts = address
+        ? [
+          address.name,
+          address.street,
+          address.city,
+          address.region,
+          address.postalCode,
+        ].filter((part): part is string => Boolean(part?.trim()))
+        : [];
+      const coordinates = current.coords;
+      const label = addressParts.length
+        ? [...new Set(addressParts)].join(', ')
+        : `${coordinates.latitude.toFixed(5)}, ${coordinates.longitude.toFixed(5)}`;
+      const nextLocation: FormJsonValue = {
+        label,
+        latitude: coordinates.latitude,
+        longitude: coordinates.longitude,
+        accuracy: coordinates.accuracy,
+        captured_at: new Date(current.timestamp).toISOString(),
+      };
+
+      setGpsLocation(nextLocation);
+      updateLocalFieldValue(locationFieldId, label);
+      setFieldErrors((currentErrors) => {
+        const next = { ...currentErrors };
+        delete next[locationFieldId];
+        return next;
+      });
+      markFieldDirty(locationFieldId, true);
+      setDetailMessage(
+        addressParts.length
+          ? `Current location ready${coordinates.accuracy !== null ? ` · ±${Math.round(coordinates.accuracy)} m` : ''}. Confirm or edit it before saving.`
+          : 'Address lookup was unavailable; current coordinates are ready. Confirm or edit them before saving.',
+      );
+    } catch (error) {
+      setLocationError(`${errorMessage(error, 'Could not get the current location.')} You can enter a place manually.`);
+    } finally {
+      setLocationLoading(false);
+    }
+  };
+
   const saveIncidentDetailsEdits = async () => {
     if (!draft || draft.status !== 'draft' || !revisionId) return;
     const occurredAtInput = fieldValues[occurredAtFieldId];
@@ -1219,7 +1493,9 @@ export default function IncidentDraftRoute() {
       occurredAt = new Date(timestamp).toISOString();
     }
 
-    const location = locationValue(draft.location, locationText);
+    const savedLocationLabel = formatLocation(draft.location)?.trim() ?? '';
+    const existingLocation = locationText.trim() === savedLocationLabel ? draft.location : null;
+    const location = gpsLocation ?? locationValue(existingLocation, locationText);
     setSavingFieldId('incident-details');
     setDetailMessage(null);
     setErrorText(null);
@@ -1227,6 +1503,7 @@ export default function IncidentDraftRoute() {
       const nextVersion = await saveIncidentDetails(draft, occurredAt, location);
       markFieldDirty(occurredAtFieldId, false);
       markFieldDirty(locationFieldId, false);
+      setGpsLocation(null);
       savedValuesRef.current = {
         ...savedValuesRef.current,
         [occurredAtFieldId]: toLocalDateTimeInput(occurredAt),
@@ -1608,7 +1885,14 @@ export default function IncidentDraftRoute() {
         <Text variant="titleLarge">Incident draft unavailable</Text>
         {errorText ? <HelperText type="error">{errorText}</HelperText> : null}
         <Button onPress={() => void loadDraft()}>Retry</Button>
-        <Button onPress={() => router.replace('/(driver)/incidents')}>Back to incidents</Button>
+        <Button
+          mode="text"
+          icon="arrow-left"
+          accessibilityLabel={backLabel}
+          onPress={handleBack}
+        >
+          {backLabel}
+        </Button>
       </SafeAreaView>
     );
   }
@@ -1656,13 +1940,31 @@ export default function IncidentDraftRoute() {
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <ScrollView ref={scrollRef} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-        <View style={styles.header}>
-          <Button onPress={() => router.back()}>Back</Button>
-          <Text variant="labelLarge">
-            {readOnly ? 'Submitted' : 'Draft'} · revision {draft.version}
-          </Text>
+      <KeyboardAvoidingView
+        style={styles.flex}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      >
+        <View style={styles.stickyHeader}>
+          <View style={styles.headerContent}>
+            <Button
+              mode="text"
+              icon="arrow-left"
+              accessibilityLabel={backLabel}
+              onPress={handleBack}
+              style={styles.backButton}
+            >
+              {backLabel}
+            </Button>
+            <Text variant="labelLarge" style={styles.revisionLabel}>
+              {readOnly ? 'Submitted' : 'Draft'} · revision {draft.version}
+            </Text>
+          </View>
         </View>
+        <ScrollView
+          ref={scrollRef}
+          contentContainerStyle={styles.content}
+          keyboardShouldPersistTaps="handled"
+        >
         {readOnly ? (
           <Card>
             <Card.Content style={styles.cardContent}>
@@ -1729,25 +2031,25 @@ export default function IncidentDraftRoute() {
           <Card.Content style={styles.cardContent}>
             <Text variant="titleMedium">Confirm incident details</Text>
             <Text variant="bodySmall">
-              Confirm or correct the occurred time and location. Location may be entered manually; GPS is optional.
+              Confirm the local date and time, then enter a place or add your current location. GPS is optional.
             </Text>
-            <TextInput
-              mode="outlined"
+            <DateTimeFieldEditor
               label="Occurred at (local date and time)"
+              type="datetime"
               value={typeof fieldValues[occurredAtFieldId] === 'string'
                 ? fieldValues[occurredAtFieldId] as string
                 : ''}
-              onChangeText={(value) => {
+              onChange={(value) => {
                 updateLocalFieldValue(occurredAtFieldId, value);
                 setFieldErrors((current) => ({ ...current, [occurredAtFieldId]: '' }));
                 markFieldDirty(
                   occurredAtFieldId,
-                  toLocalDateTimeInput(draft.occurredAt) !== value,
+                  !draft.occurredAt
+                    || new Date(draft.occurredAt).getTime() !== new Date(value).getTime(),
                 );
                 setDetailMessage(null);
               }}
               disabled={controlsDisabled}
-              placeholder="YYYY-MM-DDTHH:mm"
             />
             {fieldErrors[occurredAtFieldId] ? (
               <HelperText type="error" visible>{fieldErrors[occurredAtFieldId]}</HelperText>
@@ -1755,25 +2057,47 @@ export default function IncidentDraftRoute() {
             <TextInput
               mode="outlined"
               label="Incident location"
+              accessibilityLabel="Incident location"
               value={typeof fieldValues[locationFieldId] === 'string'
                 ? fieldValues[locationFieldId] as string
                 : ''}
               onChangeText={(value) => {
                 updateLocalFieldValue(locationFieldId, value);
-                markFieldDirty(locationFieldId, (formatLocation(draft.location) ?? '') !== value.trim());
+                setGpsLocation(null);
+                setLocationError(null);
+                markFieldDirty(
+                  locationFieldId,
+                  gpsLocation !== null || (formatLocation(draft.location) ?? '') !== value.trim(),
+                );
                 setDetailMessage(null);
               }}
               disabled={controlsDisabled}
               placeholder="Enter a place, address, or highway marker"
             />
+            {!readOnly ? (
+              <Button
+                mode="outlined"
+                icon="crosshairs-gps"
+                onPress={() => void useCurrentLocation()}
+                disabled={controlsDisabled || locationLoading}
+                loading={locationLoading}
+              >
+                Use current location
+              </Button>
+            ) : null}
+            {locationError ? <HelperText type="error" visible>{locationError}</HelperText> : null}
             <Text variant="bodySmall">
-              {draft.location ? `Saved location: ${formatLocation(draft.location) ?? 'Location details available'}` : 'No GPS location is available.'}
+              {gpsLocation
+                ? 'Current GPS location is selected but has not been saved.'
+                : draft.location
+                  ? `Saved location: ${formatLocation(draft.location) ?? 'Location details available'}`
+                  : 'No location is saved yet.'}
             </Text>
             {!readOnly ? (
               <Button
                 mode="contained"
                 onPress={() => void saveIncidentDetailsEdits()}
-                disabled={!detailsDirty || controlsDisabled}
+                disabled={!detailsDirty || controlsDisabled || locationLoading}
                 loading={savingFieldId === 'incident-details'}
               >
                 Save and confirm details
@@ -1940,23 +2264,30 @@ export default function IncidentDraftRoute() {
                   )}
                   disabled={controlsDisabled || !historyForm.definition}
                   readOnly={historyField.configurationError !== null}
+                  onBlur={() => validateEditedField(
+                    historyForm,
+                    historyField,
+                    historyAnswer.groupInstanceId,
+                  )}
                 />
                 {fieldErrors[historyValueId] ? (
                   <HelperText type="error" visible>{fieldErrors[historyValueId]}</HelperText>
                 ) : null}
                 {historyForm.activationStatus === 'triggered' ? (
-                  <Button
-                    mode="contained"
-                    onPress={() => void saveField(
-                      historyForm,
-                      historyField,
-                      historyAnswer.groupInstanceId,
-                    )}
-                    disabled={controlsDisabled || !dirtyFields[historyValueId]}
-                    loading={savingFieldId === historyValueId}
-                  >
-                    Save correction
-                  </Button>
+                  dirtyFields[historyValueId] ? (
+                    <Button
+                      mode="contained"
+                      onPress={() => void saveField(
+                        historyForm,
+                        historyField,
+                        historyAnswer.groupInstanceId,
+                      )}
+                      disabled={controlsDisabled}
+                      loading={savingFieldId === historyValueId}
+                    >
+                      Save correction
+                    </Button>
+                  ) : null
                 ) : (
                   <HelperText type="info" visible>
                     This form is no longer triggered by confirmed answers. Its previous response is retained for review; update the triggering answer first.
@@ -2034,12 +2365,102 @@ export default function IncidentDraftRoute() {
             })}
           </Card.Content>
         </Card>
+        <Card>
+          <Card.Content style={styles.cardContent}>
+            <Text variant="titleMedium">Report preview</Text>
+            <Text variant="bodySmall">
+              Preview saved details and answers at any time. Unfilled fields are omitted, and the server remains the source of submission requirements.
+            </Text>
+            <Button
+              mode="outlined"
+              icon={previewVisible ? 'eye-off-outline' : 'eye-outline'}
+              accessibilityState={{ expanded: previewVisible }}
+              onPress={() => setPreviewVisible((visible) => !visible)}
+            >
+              {previewVisible ? 'Hide report preview' : 'Preview saved answers'}
+            </Button>
+            {previewVisible ? (
+              <View style={styles.previewContainer}>
+                <Text variant="titleSmall">Incident details</Text>
+                <View style={styles.previewAnswer}>
+                  <Text variant="labelLarge">Occurred at</Text>
+                  <Text variant="bodyMedium">
+                    {formatDateControlValue(draft.occurredAt, 'datetime') ?? 'Not provided'}
+                  </Text>
+                </View>
+                <View style={styles.previewAnswer}>
+                  <Text variant="labelLarge">Location</Text>
+                  <Text variant="bodyMedium">{formatLocation(draft.location) ?? 'Not provided'}</Text>
+                </View>
+                {draft.forms
+                  .filter((form) => form.activationStatus === 'triggered')
+                  .map((form) => {
+                    const formAnswers = draft.answers.filter((answer) => answer.formKey === form.formKey);
+                    const expanded = expandedPreviewForms[form.formKey] ?? false;
+                    return (
+                      <List.Accordion
+                        key={`preview:${form.formKey}`}
+                        title={formTitle(form)}
+                        description={`${formAnswers.length} saved answers`}
+                        expanded={expanded}
+                        onPress={() => setExpandedPreviewForms((current) => ({
+                          ...current,
+                          [form.formKey]: !expanded,
+                        }))}
+                        left={(props) => <List.Icon {...props} icon="file-document-outline" />}
+                        style={styles.previewAccordion}
+                      >
+                        {formAnswers.length ? formAnswers.map((answer) => {
+                          const field = findAnswerField(
+                            draft,
+                            answer.formKey,
+                            answer.fieldKey,
+                            answer.groupInstanceId,
+                          );
+                          return (
+                            <View key={answerIdentity(answer)} style={styles.previewAnswer}>
+                              <Text variant="labelLarge">
+                                {field ? getFieldPrompt(field) : answer.fieldKey}
+                              </Text>
+                              <Text variant="bodyMedium">
+                                {field ? displayAnswer(field, answer.value) : 'Saved response'}
+                              </Text>
+                              <Text variant="bodySmall">
+                                {`${answerStateLabel(answer.answerState)} · ${answer.source}`}
+                              </Text>
+                            </View>
+                          );
+                        }) : (
+                          <HelperText type="info" visible>No form answers have been saved.</HelperText>
+                        )}
+                        {!readOnly ? (
+                          <Button
+                            mode="outlined"
+                            icon="pencil-outline"
+                            onPress={() => {
+                              setExpandedForms((current) => ({ ...current, [form.formKey]: true }));
+                              scrollRef.current?.scrollTo({
+                                y: formOffsetsRef.current[form.formKey] ?? 0,
+                                animated: true,
+                              });
+                            }}
+                          >
+                            {`Edit ${formTitle(form)}`}
+                          </Button>
+                        ) : null}
+                      </List.Accordion>
+                    );
+                  })}
+              </View>
+            ) : null}
+          </Card.Content>
+        </Card>
         {(interviewComplete || readOnly) ? (
           <Card>
             <Card.Content style={styles.cardContent}>
               <Text variant="titleLarge">{readOnly ? 'Submitted report' : 'Review & submit'}</Text>
               <Text variant="bodySmall">
-                Review every pinned form, answer status, and evidence item below. Check server readiness for this saved revision before device confirmation; submission validates again and will not submit if anything changed or remains incomplete.
+                Check server readiness for this revision before device confirmation. Submission validates again and will not proceed while anything is incomplete or unsaved.
               </Text>
               <Text variant="labelLarge">Applicable forms</Text>
               {draft.forms.filter((form) => form.activationStatus === 'triggered').length ? (
@@ -2208,14 +2629,33 @@ export default function IncidentDraftRoute() {
           const isActive = form.activationStatus === 'triggered';
           const fields = form.definition?.fields ?? [];
           const scalarFields = fields.filter((field) => field.groupKey === null);
-          let previousSection: string | null = null;
+          const formAnswers = draft.answers.filter((answer) => answer.formKey === form.formKey);
+          const formUnsavedCount = Object.entries(dirtyFields).filter(([fieldId, dirty]) => {
+            return dirty && parseAnswerFieldId(fieldId)?.[0] === form.formKey;
+          }).length;
+          const expanded = expandedForms[form.formKey] ?? false;
+          const sections = new Map<string, FormFieldDefinition[]>();
+          for (const field of scalarFields) {
+            const section = field.section?.trim() || 'Other details';
+            const sectionFields = sections.get(section) ?? [];
+            sectionFields.push(field);
+            sections.set(section, sectionFields);
+          }
+          const formIssueCount = submitIssues.filter((issue) => issue.formKey === form.formKey).length;
           return (
-            <Card key={`${form.formKey}:${form.version}`}>
+            <Card
+              key={`${form.formKey}:${form.version}`}
+              onLayout={(event) => {
+                formOffsetsRef.current[form.formKey] = event.nativeEvent.layout.y;
+              }}
+            >
               <Card.Content style={styles.cardContent}>
                 <View style={styles.formHeader}>
                   <View style={styles.formTitle}>
                     <Text variant="titleMedium">{formTitle(form)}</Text>
-                    <Text variant="bodySmall">Pinned version {form.version}</Text>
+                    <Text variant="bodySmall">
+                      {`Pinned v${form.version} · ${formAnswers.length} saved${formUnsavedCount ? ` · ${formUnsavedCount} unsaved` : ''}`}
+                    </Text>
                   </View>
                   <Chip compact>{isActive ? 'Active' : 'Not triggered'}</Chip>
                 </View>
@@ -2227,167 +2667,260 @@ export default function IncidentDraftRoute() {
                     {warning}
                   </HelperText>
                 ))}
-                {scalarFields.map((field) => {
-                  const fieldId = answerValueId(form.formKey, field.key, null);
-                  const savedAnswer = draft.answers.find(
-                    (answer) => answer.formKey === form.formKey
-                      && answer.fieldKey === field.key
-                      && answer.groupInstanceId === null,
-                  );
-                  const showSection = field.section !== null && field.section !== previousSection;
-                  previousSection = field.section;
-                  const value = fieldValues[fieldId] ?? initialFieldValue(field, null);
-                  return (
-                    <View key={fieldId} style={styles.field}>
-                      {showSection ? (
-                        <Text variant="titleSmall" style={styles.sectionHeading}>
-                          {field.section}
-                        </Text>
-                      ) : null}
-                      <IncidentFieldEditor
-                        field={field}
-                        value={value}
-                        onChange={(next) => changeAnswerValue(form, field, next, null)}
-                        disabled={controlsDisabled || !isActive}
-                        readOnly={readOnly || !isActive}
-                      />
-                      {savedAnswer ? (
-                        <Text variant="bodySmall">{`Source: ${savedAnswer.source}`}</Text>
-                      ) : null}
-                      {savedAnswer && savedAnswer.answerState !== 'confirmed' ? (
-                        <>
-                          <Chip compact>
-                            {`Saved status: ${answerStateLabel(savedAnswer.answerState)}`}
-                          </Chip>
-                          {field.required || field.key === 'injuries' ? (
-                            <HelperText type="error" visible>
-                              This required or safety-critical answer is not confirmed and will block submission.
-                            </HelperText>
-                          ) : null}
-                        </>
-                      ) : null}
-                      {fieldErrors[fieldId] ? (
-                        <HelperText type="error" visible>{fieldErrors[fieldId]}</HelperText>
-                      ) : null}
-                      {!readOnly && isActive && !field.configurationError ? (
-                        <Button
-                          mode="contained"
-                          onPress={() => void saveField(form, field, null)}
-                          disabled={
-                            controlsDisabled
-                            || !dirtyFields[fieldId]
-                            || (fieldId !== narrativeId && narrativeDirty)
-                          }
-                          loading={savingFieldId === fieldId}
+                {formIssueCount ? (
+                  <HelperText type="error" visible>
+                    {`${formIssueCount} server requirement${formIssueCount === 1 ? '' : 's'} need attention.`}
+                  </HelperText>
+                ) : null}
+                {!isActive ? (
+                  <Text variant="bodySmall">
+                    Not triggered by confirmed answers. Related incident answers may activate this form.
+                  </Text>
+                ) : (
+                  <Button
+                    mode={expanded ? 'contained-tonal' : 'outlined'}
+                    icon={expanded ? 'chevron-up' : 'chevron-down'}
+                    accessibilityState={{ expanded }}
+                    onPress={() => setExpandedForms((current) => ({
+                      ...current,
+                      [form.formKey]: !expanded,
+                    }))}
+                  >
+                    {expanded ? 'Hide form fields' : 'Show form fields'}
+                  </Button>
+                )}
+                {expanded ? (
+                  <View style={styles.formSections}>
+                    {[...sections].map(([section, sectionFields]) => {
+                      const sectionId = JSON.stringify([form.formKey, section]);
+                      const sectionExpanded = expandedSections[sectionId] ?? false;
+                      const sectionSavedCount = sectionFields.filter((field) => formAnswers.some(
+                        (answer) => answer.fieldKey === field.key && answer.groupInstanceId === null,
+                      )).length;
+                      const sectionUnsavedCount = sectionFields.filter(
+                        (field) => dirtyFields[answerValueId(form.formKey, field.key, null)],
+                      ).length;
+                      const sectionIssueCount = submitIssues.filter(
+                        (issue) => issue.formKey === form.formKey
+                          && sectionFields.some((field) => issue.fieldKey === field.key),
+                      ).length;
+                      return (
+                        <List.Accordion
+                          key={sectionId}
+                          title={section}
+                          description={`${sectionFields.length} fields · ${sectionSavedCount} saved${sectionUnsavedCount ? ` · ${sectionUnsavedCount} unsaved` : ''}${sectionIssueCount ? ` · ${sectionIssueCount} needs attention` : ''}`}
+                          expanded={sectionExpanded}
+                          onPress={() => setExpandedSections((current) => ({
+                            ...current,
+                            [sectionId]: !sectionExpanded,
+                          }))}
+                          left={(props) => (
+                            <List.Icon
+                              {...props}
+                              icon={sectionExpanded ? 'folder-open-outline' : 'folder-outline'}
+                            />
+                          )}
+                          style={styles.sectionAccordion}
                         >
-                          Save answer
-                        </Button>
-                      ) : null}
-                    </View>
-                  );
-                })}
-                {form.definition?.groups.map((group) => {
-                  const instances = draft.groups
-                    .filter((entry) => entry.formKey === form.formKey && entry.groupKey === group.key)
-                    .sort((left, right) => left.position - right.position);
-                  const groupFields = fields.filter((field) => field.groupKey === group.key);
-                  return (
-                    <View key={`${form.formKey}:group:${group.key}`} style={styles.groupSection}>
-                      <View style={styles.formHeader}>
-                        <Text variant="titleSmall">
-                          {`${group.label}${group.required ? ' · Required group' : ''}`}
-                        </Text>
-                        {!readOnly && isActive ? (
-                          <Button
-                            compact
-                            mode="outlined"
-                            onPress={() => void addRepeatedGroup(form, group.key)}
-                            disabled={controlsDisabled || creatingGroup === `${form.formKey}:${group.key}`}
-                            loading={creatingGroup === `${form.formKey}:${group.key}`}
-                          >
-                            Add
-                          </Button>
-                        ) : null}
-                      </View>
-                      {!instances.length ? (
-                        <HelperText type={group.required ? 'error' : 'info'} visible>
-                          {group.required ? 'At least one repeated item is required.' : 'No repeated items added.'}
-                        </HelperText>
-                      ) : null}
-                      {instances.map((instance, index) => {
-                        const hasUnsavedValues = Object.entries(dirtyFields).some(([fieldId, dirty]) => {
-                          const identity = parseAnswerFieldId(fieldId);
-                          return dirty && identity?.[2] === instance.id;
-                        });
-                        return (
-                          <View key={instance.id} style={styles.groupInstance}>
-                            <View style={styles.formHeader}>
-                              <Text variant="labelLarge">{`${group.label} ${index + 1}`}</Text>
-                              {!readOnly ? (
-                                <Button
-                                  compact
-                                  mode="outlined"
-                                  onPress={() => confirmRemoveRepeatedGroup(instance, group.label)}
-                                  disabled={
-                                    controlsDisabled
-                                    || !isActive
-                                    || deletingGroup === instance.id
-                                    || (group.required && instances.length === 1)
-                                    || hasUnsavedValues
-                                  }
-                                  loading={deletingGroup === instance.id}
-                                >
-                                  Remove
-                                </Button>
-                              ) : null}
-                            </View>
-                            {hasUnsavedValues ? (
-                              <HelperText type="info" visible>
-                                Save or discard unsaved fields before removing this item.
-                              </HelperText>
+                          {sectionFields.map((field) => {
+                            const fieldId = answerValueId(form.formKey, field.key, null);
+                            const savedAnswer = formAnswers.find(
+                              (answer) => answer.fieldKey === field.key
+                                && answer.groupInstanceId === null,
+                            );
+                            const value = fieldValues[fieldId] ?? initialFieldValue(field, null);
+                            return (
+                              <View key={fieldId} style={styles.field}>
+                                <IncidentFieldEditor
+                                  field={field}
+                                  value={value}
+                                  onChange={(next) => changeAnswerValue(form, field, next, null)}
+                                  disabled={controlsDisabled || !isActive}
+                                  readOnly={readOnly || !isActive}
+                                  onBlur={() => validateEditedField(form, field, null)}
+                                />
+                                {savedAnswer ? (
+                                  <Text variant="bodySmall">{`Source: ${savedAnswer.source}`}</Text>
+                                ) : null}
+                                {savedAnswer && savedAnswer.answerState !== 'confirmed' ? (
+                                  <>
+                                    <Chip compact>
+                                      {`Saved status: ${answerStateLabel(savedAnswer.answerState)}`}
+                                    </Chip>
+                                    {field.required || field.key === 'injuries' ? (
+                                      <HelperText type="error" visible>
+                                        This required or safety-critical answer is not confirmed and will block submission.
+                                      </HelperText>
+                                    ) : null}
+                                  </>
+                                ) : null}
+                                {fieldErrors[fieldId] ? (
+                                  <HelperText type="error" visible accessibilityLiveRegion="polite">
+                                    {fieldErrors[fieldId]}
+                                  </HelperText>
+                                ) : null}
+                                {!readOnly && isActive && !field.configurationError && dirtyFields[fieldId] ? (
+                                  <Button
+                                    mode="contained"
+                                    onPress={() => void saveField(form, field, null)}
+                                    disabled={
+                                      controlsDisabled
+                                      || (fieldId !== narrativeId && narrativeDirty)
+                                    }
+                                    loading={savingFieldId === fieldId}
+                                  >
+                                    Save answer
+                                  </Button>
+                                ) : null}
+                              </View>
+                            );
+                          })}
+                        </List.Accordion>
+                      );
+                    })}
+                    {form.definition?.groups.map((group) => {
+                      const groupId = JSON.stringify([form.formKey, group.key]);
+                      const groupExpanded = expandedGroups[groupId] ?? false;
+                      const instances = draft.groups
+                        .filter((entry) => entry.formKey === form.formKey && entry.groupKey === group.key)
+                        .sort((left, right) => left.position - right.position);
+                      const groupFields = fields.filter((field) => field.groupKey === group.key);
+                      const groupUnsavedCount = Object.entries(dirtyFields).filter(([fieldId, dirty]) => {
+                        const identity = parseAnswerFieldId(fieldId);
+                        return dirty
+                          && identity?.[0] === form.formKey
+                          && groupFields.some((field) => field.key === identity[1])
+                          && instances.some((instance) => instance.id === identity[2]);
+                      }).length;
+                      return (
+                        <View key={groupId} style={styles.groupSection}>
+                          <View style={styles.groupHeader}>
+                            <Pressable
+                              accessibilityRole="button"
+                              accessibilityLabel={`${group.label}, ${instances.length} items${groupUnsavedCount ? `, ${groupUnsavedCount} unsaved changes` : ''}`}
+                              accessibilityState={{ expanded: groupExpanded }}
+                              onPress={() => setExpandedGroups((current) => ({
+                                ...current,
+                                [groupId]: !groupExpanded,
+                              }))}
+                              style={styles.groupToggle}
+                            >
+                              <View style={styles.formTitle}>
+                                <Text variant="titleSmall">
+                                  {`${group.label}${group.required ? ' · Required group' : ''}`}
+                                </Text>
+                                <Text variant="bodySmall">
+                                  {instances.length
+                                    ? `${instances.length} item${instances.length === 1 ? '' : 's'}${groupUnsavedCount ? ` · ${groupUnsavedCount} unsaved` : ''}`
+                                    : group.required ? 'Required · no items added' : 'Optional · no items added'}
+                                </Text>
+                              </View>
+                              <List.Icon icon={groupExpanded ? 'chevron-up' : 'chevron-down'} />
+                            </Pressable>
+                            {!readOnly && isActive ? (
+                              <Button
+                                compact
+                                mode="outlined"
+                                icon="plus"
+                                onPress={() => {
+                                  setExpandedGroups((current) => ({ ...current, [groupId]: true }));
+                                  void addRepeatedGroup(form, group.key);
+                                }}
+                                disabled={controlsDisabled || creatingGroup === `${form.formKey}:${group.key}`}
+                                loading={creatingGroup === `${form.formKey}:${group.key}`}
+                              >
+                                Add
+                              </Button>
                             ) : null}
-                            {groupFields.map((field) => {
-                              const fieldId = answerValueId(form.formKey, field.key, instance.id);
-                              const savedAnswer = draft.answers.find(
-                                (answer) => answer.formKey === form.formKey
-                                  && answer.fieldKey === field.key
-                                  && answer.groupInstanceId === instance.id,
-                              );
-                              const value = fieldValues[fieldId] ?? initialFieldValue(field, savedAnswer?.value ?? null);
+                          </View>
+                          {groupExpanded ? (
+                            instances.length ? instances.map((instance, index) => {
+                              const hasUnsavedValues = Object.entries(dirtyFields).some(([fieldId, dirty]) => {
+                                const identity = parseAnswerFieldId(fieldId);
+                                return dirty && identity?.[2] === instance.id;
+                              });
                               return (
-                                <View key={fieldId} style={styles.field}>
-                                  <IncidentFieldEditor
-                                    field={field}
-                                    value={value}
-                                    onChange={(next) => changeAnswerValue(form, field, next, instance.id)}
-                                    disabled={controlsDisabled || !isActive}
-                                    readOnly={readOnly || !isActive}
-                                  />
-                                  {savedAnswer ? (
-                                    <Text variant="bodySmall">{`Source: ${savedAnswer.source} · ${answerStateLabel(savedAnswer.answerState)}`}</Text>
+                                <View key={instance.id} style={styles.groupInstance}>
+                                  <View style={styles.formHeader}>
+                                    <Text variant="labelLarge">{`${group.label} ${index + 1}`}</Text>
+                                    {!readOnly ? (
+                                      <Button
+                                        compact
+                                        mode="outlined"
+                                        onPress={() => confirmRemoveRepeatedGroup(instance, group.label)}
+                                        disabled={
+                                          controlsDisabled
+                                          || !isActive
+                                          || deletingGroup === instance.id
+                                          || (group.required && instances.length === 1)
+                                          || hasUnsavedValues
+                                        }
+                                        loading={deletingGroup === instance.id}
+                                      >
+                                        Remove
+                                      </Button>
+                                    ) : null}
+                                  </View>
+                                  {hasUnsavedValues ? (
+                                    <HelperText type="info" visible>
+                                      Save or discard unsaved fields before removing this item.
+                                    </HelperText>
                                   ) : null}
-                                  {fieldErrors[fieldId] ? (
-                                    <HelperText type="error" visible>{fieldErrors[fieldId]}</HelperText>
-                                  ) : null}
-                                  {!readOnly && isActive && !field.configurationError ? (
-                                    <Button
-                                      mode="contained"
-                                      onPress={() => void saveField(form, field, instance.id)}
-                                      disabled={controlsDisabled || !dirtyFields[fieldId]}
-                                      loading={savingFieldId === fieldId}
-                                    >
-                                      Save item
-                                    </Button>
-                                  ) : null}
+                                  {groupFields.map((field) => {
+                                    const fieldId = answerValueId(form.formKey, field.key, instance.id);
+                                    const savedAnswer = draft.answers.find(
+                                      (answer) => answer.formKey === form.formKey
+                                        && answer.fieldKey === field.key
+                                        && answer.groupInstanceId === instance.id,
+                                    );
+                                    const value = fieldValues[fieldId]
+                                      ?? initialFieldValue(field, savedAnswer?.value ?? null);
+                                    return (
+                                      <View key={fieldId} style={styles.field}>
+                                        <IncidentFieldEditor
+                                          field={field}
+                                          value={value}
+                                          onChange={(next) => changeAnswerValue(form, field, next, instance.id)}
+                                          disabled={controlsDisabled || !isActive}
+                                          readOnly={readOnly || !isActive}
+                                          onBlur={() => validateEditedField(form, field, instance.id)}
+                                        />
+                                        {savedAnswer ? (
+                                          <Text variant="bodySmall">
+                                            {`Source: ${savedAnswer.source} · ${answerStateLabel(savedAnswer.answerState)}`}
+                                          </Text>
+                                        ) : null}
+                                        {fieldErrors[fieldId] ? (
+                                          <HelperText type="error" visible accessibilityLiveRegion="polite">
+                                            {fieldErrors[fieldId]}
+                                          </HelperText>
+                                        ) : null}
+                                        {!readOnly && isActive && !field.configurationError && dirtyFields[fieldId] ? (
+                                          <Button
+                                            mode="contained"
+                                            onPress={() => void saveField(form, field, instance.id)}
+                                            disabled={controlsDisabled}
+                                            loading={savingFieldId === fieldId}
+                                          >
+                                            Save item
+                                          </Button>
+                                        ) : null}
+                                      </View>
+                                    );
+                                  })}
                                 </View>
                               );
-                            })}
-                          </View>
-                        );
-                      })}
-                    </View>
-                  );
-                })}
+                            }) : (
+                              <HelperText type={group.required ? 'error' : 'info'} visible>
+                                {group.required ? 'At least one repeated item is required.' : 'No repeated items added.'}
+                              </HelperText>
+                            )
+                          ) : null}
+                        </View>
+                      );
+                    })}
+                  </View>
+                ) : null}
                 {!fields.length && !form.definitionError ? (
                   <HelperText type="error" visible>
                     No fields are available in this pinned form definition.
@@ -2400,8 +2933,16 @@ export default function IncidentDraftRoute() {
         {localMessage ? <HelperText type="info">{localMessage}</HelperText> : null}
         {saveMessage ? <HelperText type="info">{saveMessage}</HelperText> : null}
         {errorText ? <HelperText type="error">{errorText}</HelperText> : null}
-        <Button onPress={() => router.replace('/(driver)/incidents')}>Back to incidents</Button>
+        <Button
+          mode="outlined"
+          icon="arrow-left"
+          accessibilityLabel={backLabel}
+          onPress={handleBack}
+        >
+          {backLabel}
+        </Button>
       </ScrollView>
+      </KeyboardAvoidingView>
     </SafeAreaView>
   );
 }
@@ -2409,20 +2950,43 @@ export default function IncidentDraftRoute() {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: '#F7F8FB',
+    backgroundColor: palette.background,
+  },
+  flex: {
+    flex: 1,
   },
   content: {
+    alignSelf: 'center',
     gap: 16,
     padding: 20,
+    width: '100%',
+    maxWidth: 760,
   },
-  header: {
+  stickyHeader: {
+    backgroundColor: palette.surface,
+    borderBottomColor: palette.border,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 20,
+  },
+  headerContent: {
     alignItems: 'center',
+    alignSelf: 'center',
     flexDirection: 'row',
+    gap: 12,
     justifyContent: 'space-between',
+    maxWidth: 760,
+    minHeight: 56,
+    width: '100%',
+  },
+  revisionLabel: {
+    color: palette.mutedText,
+  },
+  backButton: {
+    marginLeft: -8,
   },
   cardContent: {
     gap: 16,
-    padding: 18,
+    padding: 20,
   },
   formHeader: {
     alignItems: 'center',
@@ -2433,6 +2997,25 @@ const styles = StyleSheet.create({
   formTitle: {
     flexShrink: 1,
     gap: 4,
+  },
+  formSections: {
+    gap: 8,
+  },
+  sectionAccordion: {
+    backgroundColor: palette.surfaceVariant,
+    borderRadius: 12,
+    overflow: 'hidden',
+  },
+  groupHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 8,
+  },
+  groupToggle: {
+    alignItems: 'center',
+    flex: 1,
+    flexDirection: 'row',
+    minHeight: 56,
   },
   historyRow: {
     alignItems: 'center',
@@ -2445,13 +3028,13 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   historyEditor: {
-    borderTopColor: '#D5D9E1',
+    borderTopColor: palette.border,
     borderTopWidth: StyleSheet.hairlineWidth,
     gap: 12,
     paddingTop: 12,
   },
   evidenceRow: {
-    borderTopColor: '#D5D9E1',
+    borderTopColor: palette.border,
     borderTopWidth: StyleSheet.hairlineWidth,
     gap: 8,
     paddingTop: 12,
@@ -2460,26 +3043,26 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   issue: {
-    borderTopColor: '#D5D9E1',
+    borderTopColor: palette.border,
     borderTopWidth: StyleSheet.hairlineWidth,
     gap: 4,
     paddingTop: 8,
   },
   evidenceImage: {
     alignSelf: 'flex-start',
-    borderRadius: 8,
+    borderRadius: 12,
     height: 180,
     width: 240,
   },
   groupSection: {
-    borderTopColor: '#D5D9E1',
+    borderTopColor: palette.border,
     borderTopWidth: StyleSheet.hairlineWidth,
     gap: 12,
     paddingTop: 12,
   },
   groupInstance: {
-    backgroundColor: '#F4F6FA',
-    borderColor: '#E4E8F0',
+    backgroundColor: palette.surfaceVariant,
+    borderColor: palette.border,
     borderRadius: 14,
     borderWidth: StyleSheet.hairlineWidth,
     gap: 12,
@@ -2492,6 +3075,73 @@ const styles = StyleSheet.create({
   fieldControl: {
     gap: 10,
   },
+  dateTimeControls: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  dateTimeButton: {
+    borderRadius: 12,
+    flex: 1,
+    minHeight: 48,
+  },
+  dateTimeButtonContent: {
+    minHeight: 48,
+    paddingHorizontal: 8,
+  },
+  dateTimeButtonLabel: {
+    flexShrink: 1,
+    textAlign: 'left',
+  },
+  multiSelectOptions: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  multiSelectOption: {
+    alignItems: 'center',
+    backgroundColor: palette.surface,
+    borderColor: palette.outline,
+    borderRadius: 12,
+    borderWidth: StyleSheet.hairlineWidth,
+    flexBasis: '47%',
+    flexDirection: 'row',
+    flexGrow: 1,
+    gap: 4,
+    minHeight: 48,
+    minWidth: 112,
+    paddingHorizontal: 8,
+  },
+  multiSelectOptionSelected: {
+    backgroundColor: palette.primaryContainer,
+    borderColor: palette.primary,
+  },
+  multiSelectOptionDisabled: {
+    opacity: 0.6,
+  },
+  multiSelectOptionPressed: {
+    opacity: 0.75,
+  },
+  multiSelectOptionLabel: {
+    flex: 1,
+    flexShrink: 1,
+  },
+  previewContainer: {
+    borderTopColor: palette.border,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    gap: 8,
+    paddingTop: 12,
+  },
+  previewAccordion: {
+    backgroundColor: palette.surfaceVariant,
+    borderRadius: 12,
+    overflow: 'hidden',
+  },
+  previewAnswer: {
+    borderBottomColor: palette.border,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    gap: 4,
+    paddingVertical: 8,
+  },
   choiceRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -2499,13 +3149,14 @@ const styles = StyleSheet.create({
   },
   dropdownButton: {
     alignSelf: 'stretch',
-    borderRadius: 12,
+    borderRadius: 14,
   },
   dropdownButtonContent: {
     flexDirection: 'row-reverse',
-    height: 52,
+    minHeight: 52,
     justifyContent: 'space-between',
     paddingHorizontal: 8,
+    paddingVertical: 8,
   },
   dropdownButtonLabel: {
     flex: 1,
@@ -2513,10 +3164,6 @@ const styles = StyleSheet.create({
   },
   dropdownMenu: {
     borderRadius: 14,
-  },
-  sectionHeading: {
-    color: '#394150',
-    marginTop: 6,
   },
   longText: {
     minHeight: 160,

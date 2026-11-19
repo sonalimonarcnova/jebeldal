@@ -2,11 +2,13 @@ import { Redirect } from 'expo-router';
 import { Tabs } from 'expo-router';
 import { useState } from 'react';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
-import { ActivityIndicator, Button, HelperText, Text } from 'react-native-paper';
+import { ActivityIndicator, HelperText, Text } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { useAuth } from '../../src/auth/AuthProvider';
 import { resolveDriverRoute } from '../../src/auth/driverRoute';
+import { AppButton as Button } from '../../src/ui/AppButton';
+import { palette } from '../../src/ui/theme';
 
 export default function DriverTabsLayout() {
   const [actionError, setActionError] = useState<string | null>(null);
@@ -41,7 +43,7 @@ export default function DriverTabsLayout() {
   if (routeState === 'loading') {
     return (
       <SafeAreaView
-        style={{ flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#F7F8FB' }}
+        style={{ flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: palette.background }}
       >
         <ActivityIndicator accessibilityLabel="Loading driver access" />
       </SafeAreaView>
@@ -53,7 +55,7 @@ export default function DriverTabsLayout() {
   if (routeState === 'profile-error' || routeState === 'missing-profile') {
     return (
       <SafeAreaView
-        style={{ flex: 1, justifyContent: 'center', padding: 24, backgroundColor: '#F7F8FB' }}
+        style={{ flex: 1, justifyContent: 'center', padding: 24, backgroundColor: palette.background }}
       >
         <Text variant="titleLarge">Driver profile unavailable</Text>
         {profileError ? <HelperText type="error">{profileError}</HelperText> : null}
@@ -76,9 +78,13 @@ export default function DriverTabsLayout() {
     <Tabs
       screenOptions={{
         headerShown: false,
-        tabBarActiveTintColor: '#4F46E5',
-        tabBarInactiveTintColor: '#687184',
-        tabBarLabelStyle: { fontSize: 12, fontWeight: '500' },
+        tabBarActiveTintColor: palette.primary,
+        tabBarInactiveTintColor: palette.mutedText,
+        tabBarLabelStyle: { fontSize: 12, fontWeight: '600' },
+        tabBarStyle: {
+          backgroundColor: palette.surface,
+          borderTopColor: palette.border,
+        },
       }}
     >
       <Tabs.Screen
@@ -89,7 +95,7 @@ export default function DriverTabsLayout() {
           tabBarIcon: ({ color, size }) => (
             <MaterialCommunityIcons
               name="home-outline"
-              color={typeof color === 'number' ? '#687184' : color ?? '#687184'}
+              color={typeof color === 'string' ? color : palette.mutedText}
               size={size}
             />
           ),
@@ -103,7 +109,7 @@ export default function DriverTabsLayout() {
           tabBarIcon: ({ color, size }) => (
             <MaterialCommunityIcons
               name="clipboard-text-outline"
-              color={typeof color === 'number' ? '#687184' : color ?? '#687184'}
+              color={typeof color === 'string' ? color : palette.mutedText}
               size={size}
             />
           ),
@@ -117,7 +123,7 @@ export default function DriverTabsLayout() {
           tabBarIcon: ({ color, size }) => (
             <MaterialCommunityIcons
               name="account-circle-outline"
-              color={typeof color === 'number' ? '#687184' : color ?? '#687184'}
+              color={typeof color === 'string' ? color : palette.mutedText}
               size={size}
             />
           ),

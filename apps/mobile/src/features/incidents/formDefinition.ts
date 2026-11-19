@@ -363,6 +363,25 @@ export function initialFieldValue(field: FormFieldDefinition, value: unknown): u
   return '';
 }
 
+function validDate(value: string): boolean {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return false;
+  const [, yearText, monthText, dayText] = match;
+  const date = new Date(Date.UTC(Number(yearText), Number(monthText) - 1, Number(dayText)));
+  return date.getUTCFullYear() === Number(yearText)
+    && date.getUTCMonth() === Number(monthText) - 1
+    && date.getUTCDate() === Number(dayText);
+}
+
+function validDateTime(value: string): boolean {
+  const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?$/.exec(value);
+  if (!match || !validDate(match[1])) return false;
+  if (Number(match[2]) > 23 || Number(match[3]) > 59 || Number(match[4] ?? 0) > 59) {
+    return false;
+  }
+  return Number.isFinite(new Date(value).getTime());
+}
+
 export function validateFieldValue(field: FormFieldDefinition, input: unknown): FieldValueResult {
   if (field.configurationError) {
     return { ok: false, error: field.configurationError };
@@ -381,6 +400,15 @@ export function validateFieldValue(field: FormFieldDefinition, input: unknown): 
   if (['text', 'long_text', 'phone', 'email', 'date', 'datetime'].includes(field.type)) {
     if (typeof input !== 'string') {
       return { ok: false, error: `${getFieldPrompt(field)} must be text.` };
+    }
+    if (field.type === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input)) {
+      return { ok: false, error: `${getFieldPrompt(field)} must be a valid email address.` };
+    }
+    if (field.type === 'date' && !validDate(input)) {
+      return { ok: false, error: `${getFieldPrompt(field)} must be a valid date.` };
+    }
+    if (field.type === 'datetime' && !validDateTime(input)) {
+      return { ok: false, error: `${getFieldPrompt(field)} must be a valid date and time.` };
     }
     const validation = field.validation;
     if (validation?.minLength !== undefined && input.length < validation.minLength) {
@@ -426,8 +454,9 @@ export function validateFieldValue(field: FormFieldDefinition, input: unknown): 
     return Array.isArray(input)
       && input.every((value) => typeof value === 'string'
         && field.options.some((option) => option.value === value))
+      && new Set(input).size === input.length
       ? { ok: true, value: input as string[] }
-      : { ok: false, error: `${getFieldPrompt(field)} contains an option outside the pinned definition.` };
+      : { ok: false, error: `${getFieldPrompt(field)} contains an invalid or duplicate option.` };
   }
 
   return { ok: false, error: `The field type “${field.type}” is not supported in this MVP.` };

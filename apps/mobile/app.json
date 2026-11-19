@@ -42,6 +42,13 @@
         {
           "faceIDPermission": "Confirm incident report submission on this device."
         }
+      ],
+      "@react-native-community/datetimepicker",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow JebelDAL to add your current location to an incident report when you choose."
+        }
       ]
     ]
   }

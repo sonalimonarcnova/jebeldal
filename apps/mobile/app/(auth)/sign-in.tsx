@@ -4,7 +4,6 @@ import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, View } from 're
 import {
   ActivityIndicator,
   Avatar,
-  Button,
   Card,
   HelperText,
   Text,
@@ -13,6 +12,8 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { useAuth } from '../../src/auth/AuthProvider';
+import { AppButton as Button } from '../../src/ui/AppButton';
+import { palette } from '../../src/ui/theme';
 
 export default function SignInRoute() {
   const { signIn } = useAuth();
@@ -43,8 +44,16 @@ export default function SignInRoute() {
       >
         <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
           <View style={styles.brand}>
-            <Avatar.Icon size={64} icon="truck-fast-outline" style={styles.brandIcon} />
-            <Text variant="headlineMedium">JebelDAL</Text>
+            <Avatar.Icon
+              size={64}
+              icon="truck-fast-outline"
+              color={palette.primary}
+              accessible={false}
+              accessibilityElementsHidden
+              importantForAccessibility="no-hide-descendants"
+              style={styles.brandIcon}
+            />
+            <Text variant="headlineMedium" style={styles.brandTitle}>JebelDAL</Text>
             <Text variant="bodyMedium" style={styles.subtitle}>
               Sign in with your invited driver account.
             </Text>
@@ -115,16 +124,19 @@ export default function SignInRoute() {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: '#F7F8FB',
+    backgroundColor: palette.background,
   },
   flex: {
     flex: 1,
   },
   content: {
+    alignSelf: 'center',
     flexGrow: 1,
     gap: 20,
     justifyContent: 'center',
     padding: 24,
+    width: '100%',
+    maxWidth: 560,
   },
   brand: {
     alignItems: 'center',
@@ -132,14 +144,20 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   brandIcon: {
-    backgroundColor: '#E9E8FF',
+    backgroundColor: palette.primaryContainer,
     marginBottom: 4,
   },
+  brandTitle: {
+    color: palette.text,
+    fontWeight: '700',
+  },
   subtitle: {
-    color: '#58606E',
+    color: palette.mutedText,
     textAlign: 'center',
   },
   signInCard: {
+    borderColor: palette.border,
+    borderWidth: StyleSheet.hairlineWidth,
     borderRadius: 20,
   },
   form: {

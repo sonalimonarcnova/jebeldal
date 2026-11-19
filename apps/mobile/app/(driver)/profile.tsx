@@ -1,10 +1,12 @@
 import { router } from 'expo-router';
 import { useState } from 'react';
-import { ScrollView, StyleSheet } from 'react-native';
-import { Button, Card, HelperText, Text } from 'react-native-paper';
+import { ScrollView, StyleSheet, View } from 'react-native';
+import { Avatar, Card, HelperText, Text } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { useAuth } from '../../src/auth/AuthProvider';
+import { AppButton as Button } from '../../src/ui/AppButton';
+import { palette } from '../../src/ui/theme';
 
 export default function DriverAccountRoute() {
   const { profile, signOut } = useAuth();
@@ -27,21 +29,54 @@ export default function DriverAccountRoute() {
   return (
     <SafeAreaView style={styles.safeArea}>
       <ScrollView contentContainerStyle={styles.content}>
-        <Text variant="headlineMedium">Profile</Text>
+        <Text variant="headlineMedium" style={styles.title}>Profile</Text>
         {profile ? (
-          <Card>
+          <Card style={styles.card}>
             <Card.Content style={styles.cardContent}>
-              <Text variant="titleLarge">{profile.displayName}</Text>
-              <Text variant="bodyMedium">{profile.organizationName}</Text>
-              <Text variant="bodyMedium">Employee ID: {profile.employeeId || 'Not provided'}</Text>
-              <Text variant="bodyMedium">Mobile: {profile.phone || 'Not provided'}</Text>
-              <Text variant="bodyMedium">
-                Assigned unit: {profile.vehicle?.unitNumber ?? 'Not assigned'}
-              </Text>
-              <Text variant="bodyMedium">
-                Report language: {profile.preferredLanguage.toUpperCase()}
-              </Text>
-              <Button onPress={() => router.push('/(auth)/profile')}>
+              <View style={styles.profileHeading}>
+                <Avatar.Icon
+                  size={64}
+                  icon="account-outline"
+                  color={palette.primary}
+                  accessible={false}
+                  accessibilityElementsHidden
+                  importantForAccessibility="no-hide-descendants"
+                  style={styles.avatar}
+                />
+                <View style={styles.flex}>
+                  <Text variant="titleLarge" style={styles.name}>{profile.displayName}</Text>
+                  <Text variant="bodyMedium" style={styles.secondary}>{profile.organizationName}</Text>
+                </View>
+              </View>
+              <View style={styles.details}>
+                <View style={styles.detailRow}>
+                  <Text variant="labelMedium" style={styles.secondary}>Employee ID</Text>
+                  <Text variant="bodyLarge">{profile.employeeId || 'Not provided'}</Text>
+                </View>
+                <View style={styles.detailRow}>
+                  <Text variant="labelMedium" style={styles.secondary}>Mobile</Text>
+                  <Text variant="bodyLarge">{profile.phone || 'Not provided'}</Text>
+                </View>
+                <View style={styles.detailRow}>
+                  <Text variant="labelMedium" style={styles.secondary}>Assigned unit</Text>
+                  <Text variant="bodyLarge">{profile.vehicle?.unitNumber ?? 'Not assigned'}</Text>
+                </View>
+                <View style={styles.detailRow}>
+                  <Text variant="labelMedium" style={styles.secondary}>Report language</Text>
+                  <Text variant="bodyLarge">{profile.preferredLanguage.toUpperCase()}</Text>
+                </View>
+              </View>
+              <Button
+                icon="account-edit-outline"
+                mode="outlined"
+                accessibilityLabel="Review profile details"
+                onPress={() =>
+                  router.push({
+                    pathname: '/(auth)/profile',
+                    params: { returnTo: 'driver-profile' },
+                  })
+                }
+              >
                 Review profile details
               </Button>
             </Card.Content>
@@ -50,7 +85,13 @@ export default function DriverAccountRoute() {
           <HelperText type="error">Driver profile is unavailable.</HelperText>
         )}
         {errorText ? <HelperText type="error">{errorText}</HelperText> : null}
-        <Button mode="outlined" onPress={() => void handleSignOut()} loading={signingOut}>
+        <Button
+          mode="outlined"
+          icon="logout"
+          accessibilityLabel="Sign out"
+          onPress={() => void handleSignOut()}
+          loading={signingOut}
+        >
           Sign out
         </Button>
       </ScrollView>
@@ -61,13 +102,52 @@ export default function DriverAccountRoute() {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: '#F7F8FB',
+    backgroundColor: palette.background,
   },
   content: {
     gap: 16,
     padding: 20,
+    width: '100%',
+    maxWidth: 720,
+    alignSelf: 'center',
+  },
+  title: {
+    color: palette.text,
+  },
+  card: {
+    backgroundColor: palette.surface,
+    borderColor: palette.border,
+    borderRadius: 18,
+    borderWidth: StyleSheet.hairlineWidth,
   },
   cardContent: {
-    gap: 10,
+    gap: 20,
+    padding: 20,
+  },
+  profileHeading: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 16,
+  },
+  avatar: {
+    backgroundColor: palette.primaryContainer,
+  },
+  flex: {
+    flex: 1,
+  },
+  name: {
+    color: palette.text,
+  },
+  secondary: {
+    color: palette.mutedText,
+  },
+  details: {
+    backgroundColor: palette.surfaceVariant,
+    borderRadius: 14,
+    gap: 16,
+    padding: 16,
+  },
+  detailRow: {
+    gap: 4,
   },
 });

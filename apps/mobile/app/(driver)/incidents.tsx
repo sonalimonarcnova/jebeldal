@@ -1,11 +1,13 @@
 import { router, useFocusEffect } from 'expo-router';
 import { useCallback, useState } from 'react';
 import { ScrollView, StyleSheet, View } from 'react-native';
-import { ActivityIndicator, Button, Card, HelperText, SegmentedButtons, Text } from 'react-native-paper';
+import { ActivityIndicator, Card, Chip, HelperText, SegmentedButtons, Text } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { createIncidentDraft, loadIncidentCards } from '../../src/features/incidents/repository';
 import type { IncidentCard } from '../../src/features/incidents/model';
+import { AppButton as Button } from '../../src/ui/AppButton';
+import { palette } from '../../src/ui/theme';
 
 type IncidentFilter = 'draft' | 'submitted';
 
@@ -41,9 +43,9 @@ function IncidentCardView({
     <Card.Content style={styles.cardContent}>
       <View style={styles.cardTop}>
         <Text variant="labelLarge">{formatDate(incident.updatedAt)}</Text>
-        <Text variant="labelMedium">
-          {incident.status === 'submitted' ? 'Submitted · awaiting review' : 'Draft'}
-        </Text>
+        <Chip compact>
+          {incident.status === 'submitted' ? 'Submitted' : 'Draft'}
+        </Chip>
       </View>
       <Text variant="titleMedium">
         {incident.summary ?? (incident.status === 'draft' ? 'New incident report' : 'Incident report')}
@@ -55,6 +57,9 @@ function IncidentCardView({
       {incident.reportReference ? (
         <Text variant="bodySmall">Reference {incident.reportReference}</Text>
       ) : null}
+      {incident.status === 'submitted' ? (
+        <Text variant="bodySmall" style={styles.secondary}>Awaiting review</Text>
+      ) : null}
       {incident.status === 'draft' && incident.revisionVersion !== null ? (
         <Text variant="bodySmall" style={styles.secondary}>
           Saved revision {incident.revisionVersion}
@@ -65,13 +70,14 @@ function IncidentCardView({
 
   return activeRevisionId ? (
     <Card
+      style={styles.card}
       onPress={() => onOpen(activeRevisionId)}
       accessibilityLabel={incident.status === 'draft' ? 'Resume draft' : 'View submitted report'}
     >
       {content}
     </Card>
   ) : (
-    <Card>{content}</Card>
+    <Card style={styles.card}>{content}</Card>
   );
 }
 
@@ -106,7 +112,10 @@ export default function IncidentsRoute() {
     setCreateError(null);
     try {
       const revisionId = await createIncidentDraft();
-      router.push({ pathname: '/incident/[revisionId]', params: { revisionId } });
+      router.push({
+        pathname: '/incident/[revisionId]',
+        params: { revisionId, returnTo: 'incidents' },
+      });
     } catch (error) {
       setCreateError(error instanceof Error ? error.message : 'Could not create an incident draft.');
     } finally {
@@ -158,7 +167,7 @@ export default function IncidentsRoute() {
         {loading ? (
           <ActivityIndicator accessibilityLabel="Loading incidents" />
         ) : loadError ? (
-          <Card>
+          <Card style={styles.card}>
             <Card.Content style={styles.cardContent}>
               <Text variant="titleMedium">Incidents could not be loaded</Text>
               <HelperText type="error">{loadError}</HelperText>
@@ -166,8 +175,14 @@ export default function IncidentsRoute() {
             </Card.Content>
           </Card>
         ) : filteredIncidents.length === 0 ? (
-          <Card>
+          <Card style={[styles.card, styles.emptyCard]}>
             <Card.Content style={styles.cardContent}>
+              <Chip
+                compact
+                style={styles.emptyIcon}
+              >
+                {filter === 'draft' ? 'Draft workspace' : 'Report history'}
+              </Chip>
               <Text variant="titleMedium">
                 {filter === 'draft' ? 'No incident drafts yet' : 'No submitted incidents yet'}
               </Text>
@@ -190,7 +205,10 @@ export default function IncidentsRoute() {
                 key={incident.id}
                 incident={incident}
                 onOpen={(revisionId) =>
-                  router.push({ pathname: '/incident/[revisionId]', params: { revisionId } })
+                  router.push({
+                    pathname: '/incident/[revisionId]',
+                    params: { revisionId, returnTo: 'incidents' },
+                  })
                 }
               />
             ))}
@@ -204,11 +222,14 @@ export default function IncidentsRoute() {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: '#F7F8FB',
+    backgroundColor: palette.background,
   },
   content: {
     gap: 16,
     padding: 20,
+    width: '100%',
+    maxWidth: 720,
+    alignSelf: 'center',
   },
   header: {
     alignItems: 'center',
@@ -223,6 +244,7 @@ const styles = StyleSheet.create({
   },
   cardContent: {
     gap: 8,
+    padding: 18,
   },
   cardTop: {
     alignItems: 'center',
@@ -230,6 +252,19 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   secondary: {
-    color: '#58606E',
+    color: palette.mutedText,
+  },
+  card: {
+    backgroundColor: palette.surface,
+    borderColor: palette.border,
+    borderRadius: 18,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  emptyCard: {
+    marginTop: 8,
+  },
+  emptyIcon: {
+    alignSelf: 'flex-start',
+    backgroundColor: palette.primaryContainer,
   },
 });

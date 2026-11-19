@@ -366,6 +366,43 @@ test('form values follow pinned types, requiredness, options, and numeric valida
   assert.match(fields[3].configurationError, /no usable options/i);
 });
 
+test('date, date-time, email, and multi-select values reject malformed or duplicate input', () => {
+  const fields = parseFormDefinition({
+    fields: [
+      { key: 'incident_date', type: 'date', required: true },
+      { key: 'reported_at', type: 'datetime', required: true },
+      { key: 'contact_email', type: 'email', required: false },
+      {
+        key: 'conditions',
+        type: 'multi_enum',
+        required: false,
+        options: [
+          { value: 'rain', label: { en: 'Rain' } },
+          { value: 'dark', label: { en: 'Dark' } },
+        ],
+      },
+    ],
+  }).fields;
+
+  assert.deepEqual(validateFieldValue(fields[0], '2026-02-28'), { ok: true, value: '2026-02-28' });
+  assert.match(validateFieldValue(fields[0], '2026-02-31').error, /valid date/i);
+  assert.deepEqual(
+    validateFieldValue(fields[1], '2026-11-19T12:09:00.000Z'),
+    { ok: true, value: '2026-11-19T12:09:00.000Z' },
+  );
+  assert.match(validateFieldValue(fields[1], '2026-11-19T27:09').error, /valid date and time/i);
+  assert.deepEqual(validateFieldValue(fields[2], 'driver@example.com'), {
+    ok: true,
+    value: 'driver@example.com',
+  });
+  assert.match(validateFieldValue(fields[2], 'not-an-email').error, /valid email/i);
+  assert.deepEqual(validateFieldValue(fields[3], ['rain', 'dark']), {
+    ok: true,
+    value: ['rain', 'dark'],
+  });
+  assert.match(validateFieldValue(fields[3], ['rain', 'rain']).error, /duplicate/i);
+});
+
 test('answer save preserves JSON boolean, numeric, and array values in the RPC contract', async () => {
   const args = {
     p_incident_revision_id: revisionId,

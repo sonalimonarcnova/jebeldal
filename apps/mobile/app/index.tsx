@@ -1,10 +1,12 @@
 import { Redirect, router } from 'expo-router';
 import { useState } from 'react';
-import { ActivityIndicator, Button, HelperText, Text } from 'react-native-paper';
+import { ActivityIndicator, HelperText, Text } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { useAuth } from '../src/auth/AuthProvider';
 import { resolveDriverRoute } from '../src/auth/driverRoute';
+import { AppButton as Button } from '../src/ui/AppButton';
+import { palette } from '../src/ui/theme';
 
 export default function IndexRoute() {
   const {
@@ -40,7 +42,7 @@ export default function IndexRoute() {
   if (routeState === 'loading') {
     return (
       <SafeAreaView
-        style={{ flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#F7F8FB' }}
+        style={{ flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: palette.background }}
       >
         <ActivityIndicator accessibilityLabel="Loading sign-in" />
       </SafeAreaView>
@@ -50,7 +52,7 @@ export default function IndexRoute() {
   if (routeState === 'auth-error') {
     return (
       <SafeAreaView
-        style={{ flex: 1, justifyContent: 'center', padding: 24, backgroundColor: '#F7F8FB' }}
+        style={{ flex: 1, justifyContent: 'center', padding: 24, backgroundColor: palette.background }}
       >
         <Text variant="titleLarge">Unable to restore your sign-in</Text>
         <HelperText type="error">{authError}</HelperText>
@@ -67,7 +69,7 @@ export default function IndexRoute() {
   if (routeState === 'profile-error') {
     return (
       <SafeAreaView
-        style={{ flex: 1, justifyContent: 'center', padding: 24, backgroundColor: '#F7F8FB' }}
+        style={{ flex: 1, justifyContent: 'center', padding: 24, backgroundColor: palette.background }}
       >
         <Text variant="titleLarge">Driver profile unavailable</Text>
         <HelperText type="error">{profileError}</HelperText>
@@ -83,7 +85,7 @@ export default function IndexRoute() {
   if (routeState === 'missing-profile') {
     return (
       <SafeAreaView
-        style={{ flex: 1, justifyContent: 'center', padding: 24, backgroundColor: '#F7F8FB' }}
+        style={{ flex: 1, justifyContent: 'center', padding: 24, backgroundColor: palette.background }}
       >
         <Text variant="titleLarge">No driver profile is linked to this account.</Text>
         <HelperText type="info">Contact your fleet administrator for access.</HelperText>
@@ -96,7 +98,7 @@ export default function IndexRoute() {
   if (routeState === 'not-driver') {
     return (
       <SafeAreaView
-        style={{ flex: 1, justifyContent: 'center', padding: 24, backgroundColor: '#F7F8FB' }}
+        style={{ flex: 1, justifyContent: 'center', padding: 24, backgroundColor: palette.background }}
       >
         <Text variant="titleLarge">This app is for driver accounts.</Text>
         <HelperText type="error">{actionError}</HelperText>
