@@ -33,7 +33,7 @@ export type DriverProfile = {
   displayName: string;
   phone: string;
   employeeId: string;
-  preferredLanguage: string;
+  preferredLanguage: 'en';
   profileCompletedAt: string | null;
   vehicle: {
     unitNumber: string;
@@ -46,7 +46,6 @@ export type DriverProfile = {
 export type EditableDriverProfile = {
   displayName: string;
   phone: string;
-  preferredLanguage: 'en' | 'es';
 };
 
 export async function loadDriverProfile(userId: string): Promise<DriverProfile | null> {
@@ -122,7 +121,7 @@ export async function loadDriverProfile(userId: string): Promise<DriverProfile |
     displayName: profile.display_name,
     phone: profile.phone ?? '',
     employeeId: profile.employee_id ?? '',
-    preferredLanguage: profile.preferred_language,
+    preferredLanguage: 'en',
     profileCompletedAt: profile.profile_completed_at,
     vehicle,
     organizationName: organizationResult.data.display_name,
@@ -138,7 +137,7 @@ export async function updateDriverProfile(
     .update({
       display_name: profile.displayName.trim(),
       phone: profile.phone.trim() || null,
-      preferred_language: profile.preferredLanguage,
+      preferred_language: 'en',
     })
     .eq('user_id', userId)
     .select('user_id')

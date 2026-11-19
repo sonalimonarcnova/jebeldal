@@ -1,6 +1,6 @@
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(14);
+select plan(15);
 
 insert into public.organizations (id, display_name, legal_name, locale)
 values (
@@ -50,6 +50,24 @@ values (
 set local role authenticated;
 set local request.jwt.claim.sub = '55555555-5555-4555-8555-555555555551';
 set local request.jwt.claims = '{"sub":"55555555-5555-4555-8555-555555555551","role":"authenticated"}';
+
+select throws_ok(
+	$$select public.create_incident_draft('phase1_validation', 1, 'en')$$,
+	'P0001', 'PROFILE_INCOMPLETE',
+	'incomplete driver profile cannot create a draft'
+);
+
+select ok(
+	public.complete_driver_profile() is not null,
+	'driver can persist profile completion through the authenticated RPC'
+);
+
+select is(
+	public.complete_driver_profile(),
+	(select profile_completed_at from public.profiles
+	 where user_id = '55555555-5555-4555-8555-555555555551'),
+	'profile completion is idempotent'
+);
 
 select set_config(
 	'test.phase1_revision',
@@ -166,18 +184,6 @@ select throws_ok(
 	)$$,
 	'P0001', 'VALIDATION_FAILED',
 	'repeated-group child rejects an instance from a different group'
-);
-
-select ok(
-	public.complete_driver_profile() is not null,
-	'driver can persist profile completion through the authenticated RPC'
-);
-
-select is(
-	public.complete_driver_profile(),
-	(select profile_completed_at from public.profiles
-	 where user_id = '55555555-5555-4555-8555-555555555551'),
-	'profile completion is idempotent'
 );
 
 set local request.jwt.claim.sub = '55555555-5555-4555-8555-555555555552';

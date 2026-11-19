@@ -1,6 +1,6 @@
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(53);
+select plan(54);
 
 insert into public.organizations (id, display_name, legal_name, locale)
 values ('44444444-4444-4444-4444-444444444444', 'Other Fictional Fleet', 'Other Fleet LLC', 'en')
@@ -13,11 +13,11 @@ values
   ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1', 'driver3@test.jebel.local')
 on conflict (id) do nothing;
 
-insert into public.profiles (user_id, organization_id, role, display_name)
+insert into public.profiles (user_id, organization_id, role, display_name, profile_completed_at)
 values
-  ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1', '11111111-1111-1111-1111-111111111111', 'driver', 'Alex Driver'),
-  ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2', '11111111-1111-1111-1111-111111111111', 'driver', 'Casey Driver'),
-  ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1', '44444444-4444-4444-4444-444444444444', 'driver', 'Jordan Driver')
+  ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1', '11111111-1111-1111-1111-111111111111', 'driver', 'Alex Driver', timezone('utc', now())),
+  ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2', '11111111-1111-1111-1111-111111111111', 'driver', 'Casey Driver', timezone('utc', now())),
+  ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1', '44444444-4444-4444-4444-444444444444', 'driver', 'Jordan Driver', timezone('utc', now()))
 on conflict (user_id) do nothing;
 
 insert into public.form_definitions (form_key, version, status, definition)
@@ -196,6 +196,19 @@ select is(
      and form_key = 'general_liability' and field_key = 'delivery_description'),
   1, 'hidden branch answer is retained for draft recovery'
 );
+reset role;
+update public.profiles
+set profile_completed_at = null
+where user_id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1';
+set local role authenticated;
+set local request.jwt.claim.sub = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1';
+set local request.jwt.claims = '{"sub":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1","role":"authenticated"}';
+select throws_ok(
+  $$select public.submit_incident(current_setting('test.revision_id')::uuid, 11,
+    'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1', 'device_passcode', 'pgTAP device')$$,
+  'P0001', 'PROFILE_INCOMPLETE', 'incomplete profile cannot submit a complete report'
+);
+select public.complete_driver_profile();
 select is(
   public.submit_incident(current_setting('test.revision_id')::uuid, 11,
     'cccccccc-cccc-4ccc-8ccc-ccccccccccc1', 'device_passcode', 'pgTAP device')->>'status',

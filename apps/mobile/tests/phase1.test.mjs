@@ -3,7 +3,13 @@ import test from 'node:test';
 
 import { resolveDriverRoute } from '../src/auth/driverRoute.ts';
 import { draftCacheKey } from '../src/features/incidents/draftCacheKey.ts';
-import { findFieldDefinition, getFieldPrompt } from '../src/features/incidents/formDefinition.ts';
+import { resolveCachedDraftText } from '../src/features/incidents/draftRecovery.ts';
+import {
+  findFieldDefinition,
+  getFieldPrompt,
+  parseFormDefinition,
+  validateFieldValue,
+} from '../src/features/incidents/formDefinition.ts';
 import { createAuthRequestTimeoutFetch } from '../src/lib/authRequestTimeoutFetch.ts';
 import {
   formatLocation,
@@ -229,12 +235,95 @@ test('answer save surfaces stale-version and malformed server responses', async 
       data: null,
       error: { code: 'P0001', message: 'STALE_VERSION' },
     }), args),
-    /STALE_VERSION/,
+    /changed on the server.*not saved/,
+  );
+  await assert.rejects(
+    saveIncidentAnswerWith(async () => ({
+      data: null,
+      error: { code: 'P0001', message: 'VALIDATION_FAILED' },
+    }), args),
+    /server rejected this answer/i,
   );
   await assert.rejects(
     saveIncidentAnswerWith(async () => ({ data: '5', error: null }), args),
     /valid revision version/,
   );
+});
+
+test('form parsing renders only pinned fields and preserves authored English labels and sections', () => {
+  const parsed = parseFormDefinition({
+    sections: [{
+      key: 'scene',
+      label: { en: 'Scene' },
+      fields: [{
+        key: 'what_happened',
+        type: 'long_text',
+        required: true,
+        label: { en: 'Describe the incident', es: 'Descripción' },
+      }],
+    }],
+    fields: [
+      { key: 'property_damaged', type: 'boolean', required: true },
+      { key: 'unsupported_media', type: 'media', required: false },
+    ],
+  });
+
+  assert.deepEqual(parsed.fields.map((field) => field.key), [
+    'what_happened',
+    'property_damaged',
+    'unsupported_media',
+  ]);
+  assert.equal(getFieldPrompt(parsed.fields[0]), 'Describe the incident');
+  assert.equal(parsed.fields[0].section, 'Scene');
+  assert.equal(parsed.fields[2].configurationError, 'The field type “media” is not supported in this MVP.');
+  assert.equal(parsed.fields[0].required, true);
+});
+
+test('form values follow pinned types, requiredness, options, and numeric validation', () => {
+  const fields = parseFormDefinition({
+    fields: [
+      { key: 'confirmed', type: 'boolean', required: true },
+      { key: 'amount', type: 'currency', required: true, validation: { min: 1, max: 10 } },
+      {
+        key: 'kind',
+        type: 'enum',
+        required: true,
+        options: [{ value: 'authored_choice', label: { en: 'Authored choice' } }],
+      },
+      { key: 'missing_options', type: 'multi_enum', required: false },
+    ],
+  }).fields;
+
+  assert.deepEqual(validateFieldValue(fields[0], false), { ok: true, value: false });
+  assert.match(validateFieldValue(fields[0], null).error, /required/i);
+  assert.deepEqual(validateFieldValue(fields[1], '2.5'), { ok: true, value: 2.5 });
+  assert.match(validateFieldValue(fields[1], '20').error, /maximum/i);
+  assert.deepEqual(validateFieldValue(fields[2], 'authored_choice'), { ok: true, value: 'authored_choice' });
+  assert.match(validateFieldValue(fields[2], 'invented_choice').error, /pinned definition/i);
+  assert.match(fields[3].configurationError, /no usable options/i);
+});
+
+test('answer save preserves JSON boolean, numeric, and array values in the RPC contract', async () => {
+  const args = {
+    p_incident_revision_id: revisionId,
+    p_expected_version: 6,
+    p_form_key: 'auto',
+    p_field_key: 'multi_choice',
+    p_group_instance_id: null,
+    p_value: ['authored_one', 'authored_two'],
+    p_answer_state: 'confirmed',
+    p_source: 'manual',
+    p_evidence_id: null,
+  };
+  let receivedArgs;
+  const version = await saveIncidentAnswerWith(async (received) => {
+    receivedArgs = received;
+    return { data: 7, error: null };
+  }, args);
+
+  assert.equal(version, 7);
+  assert.deepEqual(receivedArgs.p_value, ['authored_one', 'authored_two']);
+  assert.equal(typeof receivedArgs.p_value, 'object');
 });
 
 test('pinned form field lookup traverses nested fields and uses authored prompt text', () => {
@@ -269,6 +358,33 @@ test('draft cache keys are isolated by user, revision, and field', () => {
     draftCacheKey('driver-one', revisionId, 'what_happened'),
     draftCacheKey('driver-one', secondRevisionId, 'what_happened'),
   );
+});
+
+test('draft recovery keeps both copies visible when the cached revision is stale', () => {
+  const cachedDraft = {
+    text: 'Unsynced local incident narrative',
+    expectedVersion: 2,
+    updatedAt: '2026-11-19T00:00:00Z',
+  };
+  const serverDraft = {
+    narrative: 'Saved server incident narrative',
+    version: 3,
+  };
+
+  assert.deepEqual(resolveCachedDraftText(cachedDraft, serverDraft), {
+    kind: 'conflict',
+    conflict: {
+      localText: cachedDraft.text,
+      serverText: serverDraft.narrative,
+      expectedVersion: 2,
+      currentVersion: 3,
+    },
+  });
+  assert.deepEqual(resolveCachedDraftText(cachedDraft, { ...serverDraft, version: 2 }), {
+    kind: 'restore',
+    text: cachedDraft.text,
+    dirty: true,
+  });
 });
 
 test('only confirmed text answers and known location labels are displayed', () => {

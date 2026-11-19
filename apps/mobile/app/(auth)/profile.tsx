@@ -1,7 +1,7 @@
 import { Redirect, router } from 'expo-router';
 import { useEffect, useState } from 'react';
 import { ScrollView, StyleSheet, View } from 'react-native';
-import { ActivityIndicator, Button, HelperText, SegmentedButtons, Text, TextInput } from 'react-native-paper';
+import { ActivityIndicator, Button, HelperText, Text, TextInput } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { useAuth } from '../../src/auth/AuthProvider';
@@ -18,16 +18,12 @@ export default function DriverProfileConfirmationRoute() {
   } = useAuth();
   const [displayName, setDisplayName] = useState(profile?.displayName ?? '');
   const [phone, setPhone] = useState(profile?.phone ?? '');
-  const [preferredLanguage, setPreferredLanguage] = useState<'en' | 'es'>(
-    profile?.preferredLanguage === 'es' ? 'es' : 'en',
-  );
   const [submitting, setSubmitting] = useState(false);
   const [errorText, setErrorText] = useState<string | null>(null);
 
   useEffect(() => {
     setDisplayName(profile?.displayName ?? '');
     setPhone(profile?.phone ?? '');
-    setPreferredLanguage(profile?.preferredLanguage === 'es' ? 'es' : 'en');
   }, [profile]);
 
   if (!session) {
@@ -57,7 +53,7 @@ export default function DriverProfileConfirmationRoute() {
     setSubmitting(true);
     setErrorText(null);
     try {
-      await confirmProfile({ displayName, phone, preferredLanguage });
+      await confirmProfile({ displayName, phone });
       router.replace('/(driver)/home');
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : 'Could not confirm driver profile.');
@@ -122,19 +118,7 @@ export default function DriverProfileConfirmationRoute() {
           editable={false}
         />
         <Text variant="bodyMedium">Organization: {profile.organizationName}</Text>
-        <Text variant="labelLarge">Report language</Text>
-        <SegmentedButtons
-          value={preferredLanguage}
-          onValueChange={(value) => {
-            if (value === 'en' || value === 'es') {
-              setPreferredLanguage(value);
-            }
-          }}
-          buttons={[
-            { value: 'en', label: 'English' },
-            { value: 'es', label: 'Espanol' },
-          ]}
-        />
+        <Text variant="bodyMedium">Report language: English (the only supported MVP language)</Text>
 
         {errorText ? <HelperText type="error">{errorText}</HelperText> : null}
         <Button

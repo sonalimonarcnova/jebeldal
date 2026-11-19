@@ -1,7 +1,13 @@
 import { z } from 'zod';
 
 import { supabase } from '../../lib/supabase';
-import { findFieldDefinition, getFieldPrompt } from './formDefinition';
+import {
+  findFieldDefinition,
+  getFieldPrompt,
+  parseFormDefinition,
+  type FormJsonValue,
+  type ParsedFormDefinition,
+} from './formDefinition';
 import { mapIncidentCards, type IncidentCard } from './model';
 import {
   createIncidentDraftWith,
@@ -34,20 +40,38 @@ const revisionFormSchema = z.object({
 });
 
 const answerSchema = z.object({
+  form_key: z.string(),
+  field_key: z.string(),
   value: z.unknown(),
   answer_state: z.enum(['confirmed', 'unknown', 'declined', 'not_applicable', 'pending_follow_up']),
 });
+
+export type IncidentForm = {
+  formKey: string;
+  version: number;
+  activationStatus: 'triggered' | 'not_triggered';
+  definition: ParsedFormDefinition | null;
+  definitionError: string | null;
+};
+
+export type IncidentAnswer = {
+  formKey: string;
+  fieldKey: string;
+  value: unknown;
+  answerState: 'confirmed' | 'unknown' | 'declined' | 'not_applicable' | 'pending_follow_up';
+};
 
 export type IncidentDraft = {
   revisionId: string;
   incidentId: string;
   version: number;
   status: 'draft' | 'submitted';
-  formKey: string;
-  formVersion: number;
-  fieldKey: string;
-  fieldPrompt: string;
+  narrativeFormKey: string | null;
+  fieldKey: string | null;
+  fieldPrompt: string | null;
   narrative: string;
+  forms: IncidentForm[];
+  answers: IncidentAnswer[];
 };
 
 function throwQueryError(operation: string, error: { code?: string; message: string }): never {
@@ -61,10 +85,12 @@ export async function createIncidentDraft(): Promise<string> {
   });
 }
 
-export async function saveIncidentTextAnswer(
+export async function saveIncidentFieldAnswer(
   draft: IncidentDraft,
+  formKey: string,
+  fieldKey: string,
+  value: FormJsonValue,
   expectedVersion: number,
-  text: string,
 ): Promise<number> {
   return saveIncidentAnswerWith(
     async (args) => {
@@ -74,10 +100,10 @@ export async function saveIncidentTextAnswer(
     {
       p_incident_revision_id: draft.revisionId,
       p_expected_version: expectedVersion,
-      p_form_key: draft.formKey,
-      p_field_key: draft.fieldKey,
+      p_form_key: formKey,
+      p_field_key: fieldKey,
       p_group_instance_id: null,
-      p_value: text,
+      p_value: value,
       p_answer_state: 'confirmed',
       p_source: 'manual',
       p_evidence_id: null,
@@ -168,69 +194,92 @@ export async function loadIncidentDraft(revisionId: string): Promise<IncidentDra
   }
   const revision = parsedRevision.data;
 
-  const formResponse = await supabase
+  const formsResponse = await supabase
     .from('incident_revision_forms')
     .select('form_key,form_version,activation_status')
     .eq('incident_revision_id', revision.id)
-    .eq('form_key', 'auto')
-    .maybeSingle();
+    .order('form_key');
 
-  if (formResponse.error) {
-    throwQueryError('Loading pinned incident form', formResponse.error);
+  if (formsResponse.error) {
+    throwQueryError('Loading pinned incident forms', formsResponse.error);
   }
-  const parsedForm = revisionFormSchema.safeParse(formResponse.data);
-  if (!parsedForm.success) {
-    throw new Error('The pinned Auto form is unavailable for this incident.');
-  }
-  const form = parsedForm.data;
-
-  const definitionResponse = await supabase
-    .from('form_definitions')
-    .select('definition')
-    .eq('form_key', form.form_key)
-    .eq('version', form.form_version)
-    .maybeSingle();
-
-  if (definitionResponse.error) {
-    throwQueryError('Loading pinned form definition', definitionResponse.error);
-  }
-  if (!definitionResponse.data) {
-    throw new Error('The pinned Auto form definition could not be found.');
+  const parsedForms = z.array(revisionFormSchema).safeParse(formsResponse.data);
+  if (!parsedForms.success) {
+    throw new Error('The pinned incident form list does not match the expected schema.');
   }
 
-  const field = findFieldDefinition(definitionResponse.data.definition, 'what_happened');
-  if (!field || !['text', 'long_text'].includes(field.type)) {
-    throw new Error('The pinned Auto form does not define a supported incident narrative field.');
-  }
+  const [forms, answers] = await Promise.all([
+    Promise.all(parsedForms.data.map(async (form): Promise<IncidentForm> => {
+      const definitionResponse = await supabase
+        .from('form_definitions')
+        .select('definition')
+        .eq('form_key', form.form_key)
+        .eq('version', form.form_version)
+        .maybeSingle();
 
-  const answerResponse = await supabase
-    .from('incident_answers')
-    .select('value,answer_state')
-    .eq('incident_revision_id', revision.id)
-    .eq('form_key', form.form_key)
-    .eq('field_key', field.key)
-    .is('group_instance_id', null)
-    .maybeSingle();
+      if (definitionResponse.error) {
+        throwQueryError(`Loading pinned ${form.form_key} form definition`, definitionResponse.error);
+      }
+      if (!definitionResponse.data) {
+        return {
+          formKey: form.form_key,
+          version: form.form_version,
+          activationStatus: form.activation_status,
+          definition: null,
+          definitionError: 'The pinned form definition could not be found.',
+        };
+      }
 
-  if (answerResponse.error) {
-    throwQueryError('Loading saved incident answer', answerResponse.error);
-  }
-  const parsedAnswer = answerSchema.safeParse(answerResponse.data);
-  if (answerResponse.data && !parsedAnswer.success) {
-    throw new Error('The saved incident answer has an invalid format.');
-  }
+      return {
+        formKey: form.form_key,
+        version: form.form_version,
+        activationStatus: form.activation_status,
+        definition: parseFormDefinition(definitionResponse.data.definition),
+        definitionError: null,
+      };
+    })),
+    (async (): Promise<IncidentAnswer[]> => {
+      const answersResponse = await supabase
+        .from('incident_answers')
+        .select('form_key,field_key,value,answer_state')
+        .eq('incident_revision_id', revision.id)
+        .is('group_instance_id', null);
+
+      if (answersResponse.error) {
+        throwQueryError('Loading saved incident answers', answersResponse.error);
+      }
+      const parsedAnswers = z.array(answerSchema).safeParse(answersResponse.data);
+      if (!parsedAnswers.success) {
+        throw new Error('The saved incident answers do not match the expected schema.');
+      }
+      return parsedAnswers.data.map((answer) => ({
+        formKey: answer.form_key,
+        fieldKey: answer.field_key,
+        value: answer.value,
+        answerState: answer.answer_state,
+      }));
+    })(),
+  ]);
+
+  const autoForm = forms.find((form) => form.formKey === 'auto');
+  const narrativeField = autoForm?.definition?.fields.find((field) => field.key === 'what_happened');
+  const narrativeAnswer = answers.find(
+    (answer) => answer.formKey === 'auto'
+      && answer.fieldKey === 'what_happened'
+      && answer.answerState === 'confirmed'
+      && typeof answer.value === 'string',
+  );
 
   return {
     revisionId: revision.id,
     incidentId: revision.incident_id,
     version: revision.version,
     status: revision.status,
-    formKey: form.form_key,
-    formVersion: form.form_version,
-    fieldKey: field.key,
-    fieldPrompt: getFieldPrompt(field),
-    narrative: parsedAnswer.success && typeof parsedAnswer.data.value === 'string'
-      ? parsedAnswer.data.value
-      : '',
+    narrativeFormKey: narrativeField ? 'auto' : null,
+    fieldKey: narrativeField?.key ?? null,
+    fieldPrompt: narrativeField ? getFieldPrompt(narrativeField) : null,
+    narrative: typeof narrativeAnswer?.value === 'string' ? narrativeAnswer.value : '',
+    forms,
+    answers,
   };
 }

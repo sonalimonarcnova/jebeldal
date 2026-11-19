@@ -11,7 +11,7 @@ Audit date: 2026-11-19
 - **SOURCE**: The workbook Question Bank contains **38 question nodes**.
 - **SOURCE**: The workbook has **16 distinct question-level `Show if` expressions**. One additional conditional screen row says the Photos & videos shot list depends on answers. Counting that screen rule gives the documented **17 `show_if`/branch expressions**.
 - The same question-level expressions are reused by multiple question nodes; the 29 conditional question rows are not 29 distinct rules.
-- **MISSING**: No versioned 38-node graph or 17-rule definition is present in `supabase/seed.sql` or mobile source.
+- **SOURCE**: `supabase/seed.sql` now stores the authored graph at `form_sets.default` version 1 under `definition.interview_graph`; a static test checks node/condition counts, stable keys, and references. The 16 question expressions and photo-screen rule are preserved as source text, not executed.
 - **MOCKUP**: 16 different question prompts were reached in this audit. This is not a full traversal: delivery, other-person/child, property, tow, cargo/hazmat, police/ticket/testing, video, prevention, and witnesses remain unverified in this run.
 - **MOBILE**: No interview node or branch ran in the Expo app.
 
@@ -84,6 +84,6 @@ Audit date: 2026-11-19
 
 - **SOURCE**: The workbook is the authored source of question wording/options and conditions.
 - **SOURCE**: Architecture requires deterministic eligibility and server validation; AI can only choose among allowed questions.
-- **MISSING**: No mobile evaluator, graph JSON, server question planner, localized prompts, no-cap path traversal, or persisted answer state exists in mobile source/seed.
+- **MISSING**: No mobile evaluator, server question planner, localized prompts, no-cap path traversal, or persisted answer state exists in mobile source. The seed graph is data only; workbook ellipses remain unresolved.
 - **BLOCKED**: AI question selection, transcript provenance, unknown/declined semantics, reload persistence, and full 38-node traversal were not validated.
 
