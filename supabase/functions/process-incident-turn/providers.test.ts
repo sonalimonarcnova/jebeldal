@@ -163,6 +163,39 @@ Deno.test('GroqExtract: 400 with reasoning_effort retries without it and keeps j
   });
 });
 
+Deno.test('provider errors keep only identifier-like error.type / error.code, never the message', async () => {
+  await withFetch(
+    [{ status: 400, body: { error: { message: 'secret-ish provider text', type: 'invalid_request_error', code: 'has spaces!' } } }],
+    async () => {
+      const error = await new GroqExtract('k', 'some/model').extract(input).catch((e) => e);
+      strictEqual(error.code, 'llm_http_400');
+      deepStrictEqual(error.info, { status: 400, type: 'invalid_request_error', code: undefined });
+      strictEqual(JSON.stringify(error.info).includes('secret-ish'), false);
+    },
+  );
+});
+
+Deno.test('GroqStt sends the given filename, model, language and response_format', async () => {
+  const original = globalThis.fetch;
+  let form: FormData | null = null;
+  globalThis.fetch = ((_url: string, init?: RequestInit) => {
+    form = init?.body as FormData;
+    return Promise.resolve(new Response(JSON.stringify({ text: ' hello ' }), { status: 200 }));
+  }) as typeof fetch;
+  try {
+    const text = await new GroqStt('k').transcribe(new Blob([new Uint8Array(4)], { type: 'audio/mp4' }), 'en', 'audio.m4a');
+    strictEqual(text, 'hello');
+    const sent = form as unknown as FormData;
+    strictEqual((sent.get('file') as File).name, 'audio.m4a');
+    strictEqual((sent.get('file') as File).type, 'audio/mp4');
+    strictEqual(sent.get('model'), 'whisper-large-v3-turbo');
+    strictEqual(sent.get('language'), 'en');
+    strictEqual(sent.get('response_format'), 'json');
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
 Deno.test('extraction prompt carries the third-party property and evidence rules', () => {
   const prompt = buildExtractionInstructions('what_happened', getCatalog());
   ok(prompt.includes('fully supported by its evidence_quote'));

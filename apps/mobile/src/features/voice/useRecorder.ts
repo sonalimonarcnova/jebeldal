@@ -6,6 +6,7 @@ import {
   useAudioRecorderState,
   type RecordingOptions,
 } from 'expo-audio';
+import { File } from 'expo-file-system';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 export type RecorderUiState = 'idle' | 'recording' | 'processing' | 'denied' | 'error';
@@ -44,6 +45,19 @@ export type UseRecorderResult = {
   cancel: () => Promise<void>;
   /** Leave 'processing' / 'error' (e.g. after the upload finished) and return to 'idle'. */
   reset: () => void;
+  /** Raw native recorder state for the dev screen (is audio really being captured?). */
+  diagnostics: RecorderDiagnostics;
+};
+
+export type RecorderDiagnostics = {
+  nativeRecording: boolean;
+  durationMillis: number;
+  /** bytes flushed to disk so far; should grow while recording */
+  fileSize: number;
+  /** raw metering in dBFS, undefined when the platform reports none */
+  meteringDb: number | undefined;
+  /** size of the finished file on disk, checked after stop */
+  lastFileBytes: number | null;
 };
 
 export function useRecorder({ onFinished, maxSeconds = MAX_RECORDING_SECONDS }: UseRecorderOptions = {}): UseRecorderResult {
@@ -54,6 +68,7 @@ export function useRecorder({ onFinished, maxSeconds = MAX_RECORDING_SECONDS }: 
   const [levels, setLevels] = useState<number[]>([]);
   const [uri, setUri] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [lastFileBytes, setLastFileBytes] = useState<number | null>(null);
 
   const stateRef = useRef<RecorderUiState>('idle');
   const stoppingRef = useRef(false);
@@ -81,7 +96,8 @@ export function useRecorder({ onFinished, maxSeconds = MAX_RECORDING_SECONDS }: 
       stoppingRef.current = true;
       const secs = Math.floor(recorder.getStatus().durationMillis / 1000);
       try {
-        if (recorder.isRecording) await recorder.stop();
+        // Always stop: Android only finalises (writes) the m4a file in stop(), even if isRecording already flipped.
+        await recorder.stop();
       } catch {
         // stop() can throw if the native recorder already stopped itself (forDuration); the file is still there.
       }
@@ -94,8 +110,10 @@ export function useRecorder({ onFinished, maxSeconds = MAX_RECORDING_SECONDS }: 
         setUiState('idle');
         return null;
       }
-      if (!fileUri) {
-        setError('Recording failed. Please try again.');
+      const onDisk = fileUri ? fileSizeOnDisk(fileUri) : null;
+      setLastFileBytes(onDisk);
+      if (!fileUri || !onDisk) {
+        setError(`No audio was saved (${fileUri ? 'file missing or empty' : 'no file'}). Please try again.`);
         setUiState('error');
         return null;
       }
@@ -123,6 +141,19 @@ export function useRecorder({ onFinished, maxSeconds = MAX_RECORDING_SECONDS }: 
       sawRecordingRef.current = false;
       // forDuration is the native backstop; the effect below also stops at maxSeconds so onFinished fires.
       recorder.record({ forDuration: maxSeconds });
+      setLastFileBytes(null);
+      // Android's record() silently does nothing if the recorder is not prepared, which would give a flat
+      // waveform and no file. Fail loudly instead.
+      if (!recorder.getStatus().isRecording) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        if (!recorder.getStatus().isRecording) {
+          await recorder.stop().catch(() => undefined);
+          await releaseAudioSession();
+          setError('The microphone did not start. Close other apps using it and try again.');
+          setUiState('error');
+          return;
+        }
+      }
       setUiState('recording');
     } catch {
       await releaseAudioSession();
@@ -171,5 +202,23 @@ export function useRecorder({ onFinished, maxSeconds = MAX_RECORDING_SECONDS }: 
     [recorder],
   );
 
-  return { state, seconds, levels, uri, error, start, stop, cancel, reset };
+  const diagnostics: RecorderDiagnostics = {
+    nativeRecording: status.isRecording,
+    durationMillis: status.durationMillis,
+    fileSize: status.fileSize,
+    meteringDb: status.metering,
+    lastFileBytes,
+  };
+
+  return { state, seconds, levels, uri, error, start, stop, cancel, reset, diagnostics };
+}
+
+/** Size of a local file in bytes, or null if it does not exist / cannot be read. */
+function fileSizeOnDisk(uri: string): number | null {
+  try {
+    const file = new File(uri.startsWith('/') ? `file://${uri}` : uri);
+    return file.exists ? (file.size ?? null) : null;
+  } catch {
+    return null;
+  }
 }

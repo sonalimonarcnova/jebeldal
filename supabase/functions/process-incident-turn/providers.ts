@@ -13,7 +13,8 @@ export type RawProposal = {
 export type ExtractInput = { transcript: string; questionKey: string; catalog: CatalogEntry[] };
 
 export interface SttProvider {
-  transcribe(audio: Blob, lang: string): Promise<string>;
+  /** `filename` must carry a provider-supported extension (e.g. "audio.m4a"); derived from audio.type if omitted. */
+  transcribe(audio: Blob, lang: string, filename?: string): Promise<string>;
 }
 
 export interface ExtractProvider {
@@ -26,16 +27,31 @@ export type Providers = { mode: ProviderMode; stt: SttProvider; extract: Extract
 
 export const PROVIDER_TIMEOUT_MS = 20_000;
 
-/** Provider failure. `code` is safe to store and log: it never contains provider text or keys. */
+/** Provider-reported error identifiers (OpenAI-style `error.type` / `error.code`), only when they look like identifiers. */
+export type ProviderErrorInfo = { status?: number; type?: string; code?: string };
+
+/** Provider failure. `code` and `info` are safe to store and log: never provider messages, transcripts or keys. */
 export class ProviderError extends Error {
   readonly code: string;
   readonly retryable: boolean;
-  constructor(code: string, retryable: boolean) {
+  readonly info: ProviderErrorInfo;
+  constructor(code: string, retryable: boolean, info: ProviderErrorInfo = {}) {
     super(code);
     this.name = 'ProviderError';
     this.code = code;
     this.retryable = retryable;
+    this.info = info;
   }
+}
+
+const IDENTIFIER = /^[A-Za-z0-9_.-]{1,64}$/;
+const safeIdentifier = (value: unknown) => (typeof value === 'string' && IDENTIFIER.test(value) ? value : undefined);
+
+/** Reads only `error.type` / `error.code` from an error body; the human-readable message is discarded. */
+async function errorInfo(response: Response): Promise<ProviderErrorInfo> {
+  const body: unknown = await response.json().catch(() => null);
+  const error = (body as { error?: { type?: unknown; code?: unknown } } | null)?.error;
+  return { status: response.status, type: safeIdentifier(error?.type), code: safeIdentifier(error?.code) };
 }
 
 type EnvReader = (name: string) => string | undefined;
@@ -74,9 +90,9 @@ async function providerFetch(stage: 'stt' | 'llm', url: string, init: RequestIni
     throw new ProviderError(`${stage}_network`, true);
   }
   if (!response.ok) {
-    await response.body?.cancel();
+    const info = await errorInfo(response);
     const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
-    throw new ProviderError(`${stage}_http_${response.status}`, retryable);
+    throw new ProviderError(`${stage}_http_${response.status}`, retryable, info);
   }
   return response;
 }
@@ -102,10 +118,10 @@ export class GroqStt implements SttProvider {
     this.apiKey = apiKey;
   }
 
-  async transcribe(audio: Blob, lang: string): Promise<string> {
-    const ext = AUDIO_EXTENSIONS[audio.type] ?? 'm4a';
+  async transcribe(audio: Blob, lang: string, filename?: string): Promise<string> {
+    const name = filename ?? `audio.${AUDIO_EXTENSIONS[audio.type] ?? 'm4a'}`;
     const form = new FormData();
-    form.append('file', audio, `turn.${ext}`);
+    form.append('file', audio, name);
     form.append('model', 'whisper-large-v3-turbo');
     form.append('language', lang);
     form.append('response_format', 'json');
@@ -334,7 +350,7 @@ export class MockStt implements SttProvider {
     this.env = env;
   }
 
-  transcribe(_audio: Blob, _lang: string): Promise<string> {
+  transcribe(_audio: Blob, _lang: string, _filename?: string): Promise<string> {
     return Promise.resolve(this.env('MOCK_TRANSCRIPT') || SCENARIO_B_TEXT);
   }
 }

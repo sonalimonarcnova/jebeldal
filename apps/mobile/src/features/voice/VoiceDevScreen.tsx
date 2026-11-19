@@ -11,6 +11,8 @@ import { EvidenceUploadError, uploadEvidence } from '../../lib/evidence';
 import { useRecorder } from './useRecorder';
 
 const QUESTION_KEY = 'what_happened';
+/** Bump on every change you need to see on the phone; if the screen shows an older value, the bundle is stale. */
+const DEV_BUILD = 'voice-dev #5 · file-system read + recorder checks';
 
 type PendingTurn =
   | { kind: 'audio'; clientTurnId: string; uri: string; evidenceId?: string; uploaded: boolean }
@@ -140,6 +142,9 @@ export function VoiceDevScreen() {
   return (
     <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
       <Text variant="headlineSmall">Voice pipeline (dev)</Text>
+      <Text variant="labelSmall" style={{ color: theme.colors.onSurfaceVariant }}>
+        {DEV_BUILD}
+      </Text>
 
       <Button mode="outlined" onPress={onNewDraft} loading={creatingDraft} disabled={creatingDraft || recording} contentStyle={styles.buttonContent}>
         New draft
@@ -170,6 +175,12 @@ export function VoiceDevScreen() {
           })}
         </View>
 
+        <Text variant="labelSmall" style={{ color: theme.colors.onSurfaceVariant }} selectable>
+          {`native ${recorder.diagnostics.nativeRecording ? 'REC' : 'idle'} · ${recorder.diagnostics.durationMillis} ms · ` +
+            `file ${recorder.diagnostics.fileSize} B · meter ${recorder.diagnostics.meteringDb?.toFixed(1) ?? '—'} dB · ` +
+            `saved ${recorder.diagnostics.lastFileBytes ?? '—'} B`}
+        </Text>
+
         {recording ? (
           <Button mode="text" onPress={() => void recorder.cancel()} contentStyle={styles.buttonContent}>
             Cancel
@@ -193,6 +204,11 @@ export function VoiceDevScreen() {
               {failure.code}
             </Text>
             <Text variant="bodyMedium">{failure.message}</Text>
+            {pendingRef.current?.kind === 'audio' ? (
+              <Text variant="bodySmall" style={{ color: theme.colors.onSurfaceVariant }} selectable>
+                uri: {pendingRef.current.uri}
+              </Text>
+            ) : null}
           </Card.Content>
           {pendingRef.current ? (
             <Card.Actions>

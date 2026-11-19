@@ -2,6 +2,7 @@ import { createClient, type SupabaseClient } from 'npm:@supabase/supabase-js@2.4
 import { corsHeaders } from '../_shared/cors.ts';
 import { incidentTurnSchema } from '../_shared/schema.ts';
 import { getCatalog, type CatalogEntry } from './catalog.ts';
+import { MIN_AUDIO_BYTES, sniffAudio } from './audio.ts';
 import { getProviders, ProviderError, type ProviderMode, type Providers } from './providers.ts';
 import { validateProposals, type Proposal, type ValidationResult } from './validate.ts';
 
@@ -149,25 +150,64 @@ async function updateTurn(db: SupabaseClient, turnId: string, patch: Record<stri
 // ---------------------------------------------------------------------------
 // Input
 // ---------------------------------------------------------------------------
-async function loadAudio(db: SupabaseClient, revisionId: string, evidenceId: string): Promise<Blob> {
+type LoadedAudio = { blob: Blob; filename: string };
+type LogContext = { revision_id: string; turn_id: string };
+
+const RERECORD = 'The recording did not save properly. Please record your answer again or type it.';
+
+/**
+ * Evidence row → storage download → content sniffing. The STT filename/type come from the real bytes, not the
+ * object path, and anything that is not supported audio is rejected here instead of failing at the provider.
+ */
+async function loadAudio(db: SupabaseClient, revisionId: string, evidenceId: string, ctx: LogContext): Promise<LoadedAudio> {
   const { data, error } = await db
     .from('evidence')
-    .select('object_path, media_type, upload_status')
+    .select('object_path, media_type, upload_status, size_bytes')
     .eq('id', evidenceId)
     .eq('incident_revision_id', revisionId)
     .maybeSingle();
   if (error) throw dbFailure('evidence_select');
-  const evidence = data as { object_path: string; media_type: string; upload_status: string } | null;
+  const evidence = data as { object_path: string; media_type: string; upload_status: string; size_bytes: number | null } | null;
+  log({
+    event: 'stage',
+    stage: 'evidence_lookup',
+    ...ctx,
+    status: evidence ? 'found' : 'missing',
+    media_type: evidence?.media_type,
+    upload_status: evidence?.upload_status,
+    size_bytes: evidence?.size_bytes,
+  });
   if (!evidence) throw new HttpError(403, 'NOT_ALLOWED', 'That recording was not found for this report.', false);
   if (evidence.media_type !== 'audio' || evidence.upload_status !== 'uploaded') {
-    throw new HttpError(400, 'VALIDATION_FAILED', 'The recording is not an uploaded audio clip.', false);
+    throw new HttpError(400, 'VALIDATION_FAILED', 'The recording is not an uploaded audio clip.', false, 'audio_not_uploaded');
   }
 
-  const { data: blob, error: downloadError } = await db.storage.from(BUCKET).download(evidence.object_path);
-  if (downloadError || !blob) {
+  const { data: stored, error: downloadError } = await db.storage.from(BUCKET).download(evidence.object_path);
+  if (downloadError || !stored) {
+    log({ event: 'stage', stage: 'storage_download', ...ctx, status: 'failed' });
     throw new HttpError(503, 'PROVIDER_UNAVAILABLE', 'Could not load the recording. Please try again.', true, 'storage_download');
   }
-  return blob;
+  const bytes = new Uint8Array(await stored.arrayBuffer());
+  const sniffed = sniffAudio(bytes);
+  log({
+    event: 'stage',
+    stage: 'storage_download',
+    ...ctx,
+    status: 'ok',
+    bytes: bytes.length,
+    content_type: stored.type || null,
+    path_ext: evidence.object_path.split('.').pop() ?? null,
+    sniffed_format: sniffed.format,
+  });
+
+  if (bytes.length < MIN_AUDIO_BYTES) {
+    throw new HttpError(400, 'VALIDATION_FAILED', RERECORD, false, 'audio_too_small');
+  }
+  if (sniffed.format === 'unknown') throw new HttpError(400, 'VALIDATION_FAILED', RERECORD, false, 'audio_not_audio');
+  if (!sniffed.sttSupported) {
+    throw new HttpError(400, 'VALIDATION_FAILED', RERECORD, false, `audio_unsupported_${sniffed.format}`);
+  }
+  return { blob: new Blob([bytes], { type: sniffed.mime }), filename: `audio.${sniffed.ext}` };
 }
 
 // ---------------------------------------------------------------------------
@@ -310,11 +350,13 @@ async function handle(req: Request): Promise<Response> {
   try {
     let transcript: string;
     if (input.audio_evidence_id) {
-      const audio = await loadAudio(db, input.incident_revision_id, input.audio_evidence_id);
+      const ctx = { revision_id: input.incident_revision_id, turn_id: turn.id };
+      const audio = await loadAudio(db, input.incident_revision_id, input.audio_evidence_id, ctx);
       const lang = (revision as { language?: string }).language || 'en';
-      const stt = await timed(() => providers.stt.transcribe(audio, lang));
+      const stt = await timed(() => providers.stt.transcribe(audio.blob, lang, audio.filename));
       transcript = stt.value;
       latency.stt = stt.ms;
+      log({ event: 'stage', stage: 'stt', ...ctx, status: 'ok', mode: providers.mode, filename: audio.filename, ms: stt.ms, chars: transcript.length });
     } else {
       transcript = (input.text ?? '').trim();
     }
@@ -390,13 +432,20 @@ async function handle(req: Request): Promise<Response> {
       .eq('id', turn.id)
       .then(() => undefined, () => undefined);
 
+    const providerInfo = error instanceof ProviderError ? error.info : {};
     log({
       event: 'turn_failed',
       revision_id: input.incident_revision_id,
       turn_id: turn.id,
       status: 'failed',
       mode: providers.mode,
+      input_kind: inputKind,
       error_code: httpError.errorCode,
+      // stage = stt | llm for provider failures; validation/storage failures carry it in error_code.
+      stage: error instanceof ProviderError ? error.code.split('_')[0] : undefined,
+      provider_status: providerInfo.status,
+      provider_error_type: providerInfo.type,
+      provider_error_code: providerInfo.code,
       latency_ms: { ...latency, total: Math.round(performance.now() - started) },
     });
     throw httpError;
