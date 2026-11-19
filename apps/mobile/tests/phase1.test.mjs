@@ -12,6 +12,7 @@ import {
 } from '../src/features/incidents/formDefinition.ts';
 import {
   createClientTurnId,
+  findPinnedQuestionMapping,
   findPinnedQuestionField,
   parseNextQuestionResponse,
   parseProcessedTurnResponse,
@@ -26,9 +27,20 @@ import {
   mapIncidentCards,
 } from '../src/features/incidents/model.ts';
 import {
+  createIncidentAnswerGroupWith,
   createIncidentDraftWith,
+  createIncidentEvidenceWith,
+  checkIncidentSubmissionReadinessWith,
+  deleteIncidentAnswerGroupWith,
+  finalizeIncidentEvidenceWith,
+  saveIncidentDetailsWith,
   saveIncidentAnswerWith,
+  submitIncidentWith,
 } from '../src/features/incidents/rpcOperations.ts';
+import { createSignatureReference } from '../src/features/incidents/submissionCache.ts';
+import {
+  resolveCachedDraftEdits,
+} from '../src/features/incidents/draftEditCache.ts';
 import { mapHomeTrip } from '../src/features/home/model.ts';
 
 const incidentId = '10000000-0000-4000-8000-000000000001';
@@ -244,14 +256,14 @@ test('answer save surfaces stale-version and malformed server responses', async 
       data: null,
       error: { code: 'P0001', message: 'STALE_VERSION' },
     }), args),
-    /changed on the server.*not saved/,
+    /changed on the server.*edits are preserved/,
   );
   await assert.rejects(
     saveIncidentAnswerWith(async () => ({
       data: null,
       error: { code: 'P0001', message: 'VALIDATION_FAILED' },
     }), args),
-    /server rejected this answer/i,
+    /server rejected/i,
   );
   await assert.rejects(
     saveIncidentAnswerWith(async () => ({ data: '5', error: null }), args),
@@ -286,6 +298,48 @@ test('form parsing renders only pinned fields and preserves authored English lab
   assert.equal(parsed.fields[0].section, 'Scene');
   assert.equal(parsed.fields[2].configurationError, 'The field type “media” is not supported in this MVP.');
   assert.equal(parsed.fields[0].required, true);
+});
+
+test('form parsing preserves repeated-group contracts and fields with identical keys in distinct groups', () => {
+  const parsed = parseFormDefinition({
+    sections: [{
+      key: 'claimants',
+      label: 'Claimants',
+      fields: [
+        {
+          key: 'claimants',
+          type: 'repeated_group',
+          required: true,
+          label: 'People involved',
+          fields: [
+            { key: 'name', type: 'text', required: true, label: 'Name' },
+            { key: 'phone', type: 'phone', required: false, label: 'Phone' },
+          ],
+        },
+        {
+          key: 'witnesses',
+          type: 'repeated_group',
+          fields: [{ key: 'name', type: 'text', required: true, label: 'Witness name' }],
+        },
+      ],
+    }],
+  });
+
+  assert.deepEqual(parsed.groups.map((group) => [group.key, group.label, group.required]), [
+    ['claimants', 'People involved', true],
+    ['witnesses', 'Witnesses', false],
+  ]);
+  assert.deepEqual(
+    parsed.fields.map((field) => [field.key, field.groupKey]),
+    [['name', 'claimants'], ['phone', 'claimants'], ['name', 'witnesses']],
+  );
+  assert.equal(findFieldDefinition({
+    sections: [{
+      key: 'claimants',
+      type: 'repeated_group',
+      fields: [{ key: 'name', type: 'text' }],
+    }],
+  }, 'name')?.groupKey, 'claimants');
 });
 
 test('form values follow pinned types, requiredness, options, and numeric validation', () => {
@@ -335,6 +389,314 @@ test('answer save preserves JSON boolean, numeric, and array values in the RPC c
   assert.equal(typeof receivedArgs.p_value, 'object');
 });
 
+test('non-confirmed answer states persist as valueless versioned saves', async () => {
+  const args = {
+    p_incident_revision_id: revisionId,
+    p_expected_version: 8,
+    p_form_key: 'auto',
+    p_field_key: 'injuries',
+    p_group_instance_id: null,
+    p_value: null,
+    p_answer_state: 'pending_follow_up',
+    p_source: 'manual',
+    p_evidence_id: null,
+  };
+  let receivedArgs;
+  const version = await saveIncidentAnswerWith(async (received) => {
+    receivedArgs = received;
+    return { data: 9, error: null };
+  }, args);
+
+  assert.equal(version, 9);
+  assert.deepEqual(receivedArgs, args);
+  await assert.rejects(
+    saveIncidentAnswerWith(async () => ({ data: 9, error: null }), {
+      ...args,
+      p_value: 'unconfirmed text',
+    }),
+    /cannot include an answer value/,
+  );
+});
+
+test('detail and repeated-group operations use the existing versioned RPC contracts', async () => {
+  const detailsArgs = {
+    p_incident_revision_id: revisionId,
+    p_expected_version: 11,
+    p_occurred_at: '2026-11-19T10:00:00.000Z',
+    p_location: { label: 'Fictional test yard' },
+  };
+  let receivedDetails;
+  assert.equal(await saveIncidentDetailsWith(async (args) => {
+    receivedDetails = args;
+    return { data: 12, error: null };
+  }, detailsArgs), 12);
+  assert.deepEqual(receivedDetails, detailsArgs);
+
+  const groupArgs = {
+    p_incident_revision_id: revisionId,
+    p_expected_version: 12,
+    p_form_key: 'general_liability',
+    p_group_key: 'witnesses',
+    p_position: 0,
+  };
+  let receivedGroup;
+  assert.equal(await createIncidentAnswerGroupWith(async (args) => {
+    receivedGroup = args;
+    return { data: '30000000-0000-4000-8000-000000000001', error: null };
+  }, groupArgs), '30000000-0000-4000-8000-000000000001');
+  assert.deepEqual(receivedGroup, groupArgs);
+
+  const deleteArgs = {
+    p_incident_revision_id: revisionId,
+    p_expected_version: 13,
+    p_group_instance_id: '30000000-0000-4000-8000-000000000001',
+  };
+  let receivedDelete;
+  assert.equal(await deleteIncidentAnswerGroupWith(async (args) => {
+    receivedDelete = args;
+    return { data: 14, error: null };
+  }, deleteArgs), 14);
+  assert.deepEqual(receivedDelete, deleteArgs);
+});
+
+test('photo evidence preparation and finalization preserve retry states', async () => {
+  const createArgs = {
+    p_incident_revision_id: revisionId,
+    p_media_type: 'photo',
+    p_size_bytes: 4096,
+    p_description: 'Fictional scene photo',
+  };
+  let received;
+  const prepared = await createIncidentEvidenceWith(async (args) => {
+    received = args;
+    return {
+      data: {
+        evidence_id: '30000000-0000-4000-8000-000000000002',
+        object_path: 'org/revision/evidence',
+        upload_status: 'pending',
+        revision_version: 13,
+      },
+      error: null,
+    };
+  }, createArgs);
+  assert.deepEqual(received, createArgs);
+  assert.deepEqual(prepared, {
+    evidenceId: '30000000-0000-4000-8000-000000000002',
+    objectPath: 'org/revision/evidence',
+    revisionVersion: 13,
+  });
+
+  assert.deepEqual(await finalizeIncidentEvidenceWith(async (args) => {
+    assert.deepEqual(args, { p_evidence_id: prepared.evidenceId });
+    return {
+      data: { upload_status: 'failed', revision_version: 14, code: 'EVIDENCE_INVALID' },
+      error: null,
+    };
+  }, prepared.evidenceId), { uploadStatus: 'failed', revisionVersion: 14 });
+
+  assert.deepEqual(await finalizeIncidentEvidenceWith(async () => ({
+    data: {
+      evidence_id: prepared.evidenceId,
+      upload_status: 'uploaded',
+      revision_version: 14,
+      idempotent: true,
+    },
+    error: null,
+  }), prepared.evidenceId), { uploadStatus: 'uploaded', revisionVersion: 14 });
+});
+
+test('submission uses a stable confirmation reference for retry and surfaces server blockers', async () => {
+  const args = {
+    p_incident_revision_id: revisionId,
+    p_expected_version: 15,
+    p_signature_reference: '30000000-0000-4000-8000-000000000003',
+    p_auth_method: 'biometric',
+    p_device_description: 'ios 18 device',
+  };
+  const calls = [];
+  const submitted = {
+    status: 'submitted',
+    incident_revision_id: revisionId,
+    report_reference: 'JBL-TEST-1',
+    version: 16,
+  };
+  const rpc = async (received) => {
+    calls.push(received);
+    return { data: submitted, error: null };
+  };
+  assert.deepEqual(await submitIncidentWith(rpc, args), {
+    kind: 'submitted',
+    revisionId,
+    reportReference: 'JBL-TEST-1',
+    status: 'submitted',
+    version: 16,
+  });
+  assert.deepEqual(await submitIncidentWith(rpc, args), {
+    kind: 'submitted',
+    revisionId,
+    reportReference: 'JBL-TEST-1',
+    status: 'submitted',
+    version: 16,
+  });
+  assert.deepEqual(calls, [args, args]);
+
+  const blocked = await submitIncidentWith(async () => ({
+    data: {
+      code: 'VALIDATION_FAILED',
+      incident_revision_id: revisionId,
+      version: 15,
+      issues: [{
+        form_key: 'auto',
+        field_key: 'injuries',
+        group_instance_id: null,
+        code: 'REQUIRED_FIELD_MISSING',
+        label: 'Driver injured?',
+        expected_type: 'enum',
+        required: true,
+        answer_state: 'unknown',
+        action: 'answer_field',
+        message: 'Complete this required field before submitting.',
+        provenance: {
+          source: 'manual',
+          confidence: 1,
+          evidence_id: null,
+          transcript_turn_id: null,
+        },
+      }],
+    },
+    error: null,
+  }), args);
+  assert.deepEqual(blocked, {
+    kind: 'blocked',
+    revisionId,
+    version: 15,
+    issues: [{
+      formKey: 'auto',
+      fieldKey: 'injuries',
+      groupInstanceId: null,
+      code: 'REQUIRED_FIELD_MISSING',
+      label: 'Driver injured?',
+      expectedType: 'enum',
+      required: true,
+      answerState: 'unknown',
+      expectedMediaType: null,
+      requiredCount: null,
+      uploadedCount: null,
+      action: 'answer_field',
+      message: 'Complete this required field before submitting.',
+      provenance: {
+        source: 'manual',
+        confidence: 1,
+        evidenceId: null,
+        transcriptTurnId: null,
+      },
+    }],
+  });
+
+  const missingPhoto = await submitIncidentWith(async () => ({
+    data: {
+      code: 'VALIDATION_FAILED',
+      incident_revision_id: revisionId,
+      version: 15,
+      issues: [{
+        form_key: 'auto',
+        field_key: '_evidence',
+        group_instance_id: null,
+        code: 'REQUIRED_EVIDENCE_MISSING',
+        label: 'Incident photo',
+        expected_media_type: 'photo',
+        required_count: 2,
+        uploaded_count: 0,
+        action: 'capture_or_upload_evidence',
+        message: 'Upload the required evidence before submitting.',
+      }],
+    },
+    error: null,
+  }), args);
+  assert.equal(missingPhoto.kind, 'blocked');
+  assert.equal(missingPhoto.issues[0].expectedMediaType, 'photo');
+  assert.equal(missingPhoto.issues[0].requiredCount, 2);
+  assert.equal(missingPhoto.issues[0].uploadedCount, 0);
+  assert.equal(missingPhoto.issues[0].action, 'capture_or_upload_evidence');
+});
+
+test('submission readiness is pinned to the current revision and reports server blockers', async () => {
+  const args = {
+    p_incident_revision_id: revisionId,
+    p_expected_version: 15,
+  };
+  assert.deepEqual(await checkIncidentSubmissionReadinessWith(async (received) => {
+    assert.deepEqual(received, args);
+    return {
+      data: { status: 'ready', incident_revision_id: revisionId, version: 15 },
+      error: null,
+    };
+  }, args), {
+    kind: 'ready',
+    revisionId,
+    version: 15,
+  });
+
+  assert.deepEqual(await checkIncidentSubmissionReadinessWith(async () => ({
+    data: {
+      code: 'VALIDATION_FAILED',
+      incident_revision_id: revisionId,
+      version: 15,
+      issues: [{
+        form_key: 'auto',
+        field_key: 'what_happened',
+        group_instance_id: null,
+        code: 'REQUIRED_FIELD_MISSING',
+        label: 'Description of accident',
+        action: 'answer_field',
+      }],
+    },
+    error: null,
+  }), args), {
+    kind: 'blocked',
+    revisionId,
+    version: 15,
+    issues: [{
+      formKey: 'auto',
+      fieldKey: 'what_happened',
+      groupInstanceId: null,
+      code: 'REQUIRED_FIELD_MISSING',
+      label: 'Description of accident',
+      expectedType: null,
+      required: null,
+      answerState: null,
+      expectedMediaType: null,
+      requiredCount: null,
+      uploadedCount: null,
+      action: 'answer_field',
+      message: null,
+      provenance: null,
+    }],
+  });
+});
+
+test('unsaved draft edits survive revision changes and confirmation references are valid UUIDs', () => {
+  const cached = {
+    expectedVersion: 4,
+    dirtyFieldIds: ['["auto","what_happened"]'],
+    values: { '["auto","what_happened"]': 'Local fictional detail' },
+    updatedAt: '2026-11-19T10:00:00.000Z',
+  };
+  assert.deepEqual(resolveCachedDraftEdits(cached, 5), {
+    kind: 'conflict',
+    values: { '["auto","what_happened"]': 'Local fictional detail' },
+    dirtyFieldIds: ['["auto","what_happened"]'],
+    expectedVersion: 4,
+    currentVersion: 5,
+  });
+  assert.deepEqual(resolveCachedDraftEdits(cached, 4), {
+    kind: 'restore',
+    values: { '["auto","what_happened"]': 'Local fictional detail' },
+    dirtyFieldIds: ['["auto","what_happened"]'],
+  });
+  assert.match(createSignatureReference(() => 0), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/);
+});
+
 test('pinned form field lookup traverses nested fields and uses authored prompt text', () => {
   const definition = {
     sections: [
@@ -364,9 +726,12 @@ test('question-flow response parsing handles authored questions, options, and co
       selection_source: 'deterministic_fallback',
       interview_complete: false,
       selected_question: {
-        key: 'injuries',
+        field_key: 'injuries',
+        form_key: 'auto',
         prompt: 'Was anyone hurt?',
         ui_type: 'single_select',
+        required: true,
+        answer_states: ['confirmed', 'unknown', 'declined', 'pending_follow_up'],
         options: [
           'No one',
           { value: 'driver', label: { en: 'The driver' } },
@@ -376,7 +741,7 @@ test('question-flow response parsing handles authored questions, options, and co
     {
       kind: 'question',
       question: {
-        formKey: null,
+        formKey: 'auto',
         fieldKey: 'injuries',
         prompt: 'Was anyone hurt?',
         options: [
@@ -384,6 +749,8 @@ test('question-flow response parsing handles authored questions, options, and co
           { value: 'driver', label: 'The driver' },
         ],
         selectionSource: 'deterministic_fallback',
+        required: true,
+        answerStates: ['confirmed', 'unknown', 'declined', 'pending_follow_up'],
       },
     },
   );
@@ -395,13 +762,50 @@ test('question-flow response parsing handles authored questions, options, and co
     parseNextQuestionResponse({ interview_complete: true }),
     { kind: 'complete' },
   );
+  assert.deepEqual(
+    parseNextQuestionResponse({
+      selected_question: {
+        form_key: 'general_liability',
+        field_key: 'property_owner',
+        prompt: 'Who owns it?',
+        required: false,
+        answer_states: [
+          'confirmed',
+          'unknown',
+          'declined',
+          'pending_follow_up',
+          'not_applicable',
+        ],
+      },
+    }).kind,
+    'question',
+  );
   assert.throws(
     () => parseNextQuestionResponse({ next_question: { field_key: 'unknown' } }),
-    /missing its key or authored prompt/,
+    /missing its pinned form, key, or authored prompt/,
   );
   assert.throws(
     () => parseNextQuestionResponse({ question: { options: 'invented' } }),
-    /missing its key or authored prompt/,
+    /missing its pinned form, key, or authored prompt/,
+  );
+});
+
+test('unmapped questions cannot infer or persist an arbitrary form association', () => {
+  const parsed = parseNextQuestionResponse({
+    selected_question: {
+      field_key: 'injuries',
+      form_key: null,
+      prompt: 'Was anyone hurt?',
+      required: true,
+      answer_states: [],
+    },
+  });
+  assert.equal(
+    findPinnedQuestionMapping(parsed.question, [
+      { formKey: 'auto', definition: { fields: [{ key: 'injuries' }] } },
+      { formKey: 'workers_comp', definition: { fields: [{ key: 'injuries' }] } },
+    ]),
+    null,
   );
 });
 
@@ -413,8 +817,11 @@ test('question-flow invocation uses the documented edge-function request bodies'
       return {
         data: {
           selected_question: {
-            key: 'what_happened',
+            field_key: 'what_happened',
+            form_key: 'auto',
             prompt: 'What happened?',
+            required: true,
+            answer_states: ['confirmed', 'unknown', 'declined', 'pending_follow_up'],
           },
           interview_complete: false,
         },
@@ -578,7 +985,7 @@ test('Home maps seeded trip data and handles optional route fields', () => {
     started_at: '2026-11-18T14:00:00Z',
     route: { origin: 'Fictional origin', destination: 'Fictional destination' },
     purpose: 'fictional demo delivery',
-    vehicle_id: null,
+    vehicle_id: '22222222-2222-2222-2222-222222222221',
     dvir_summary: { status: 'fictional demo data' },
   });
 

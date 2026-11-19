@@ -7,7 +7,11 @@ import {
   readJsonResponse,
 } from '../_shared/backend.ts';
 import { selectNextQuestionSchema } from '../_shared/schema.ts';
-import { selectNextQuestion } from '../_shared/interview.mjs';
+import {
+  buildInterviewAnswerContext,
+  prepareInterviewGraph,
+  selectNextQuestion,
+} from '../_shared/interview.mjs';
 
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
@@ -84,10 +88,59 @@ Deno.serve(async (req) => {
       return errorResponse('INTERNAL_ERROR');
     }
 
-    const answersQuery = new URLSearchParams({
-      select: 'field_key,value',
+    const pinnedFormsQuery = new URLSearchParams({
+      select: 'form_key,form_version,activation_status',
       incident_revision_id: `eq.${parsed.data.incident_revision_id}`,
-      answer_state: 'eq.confirmed',
+    });
+    const pinnedFormsResponse = await fetch(
+      `${backend.url}/rest/v1/incident_revision_forms?${pinnedFormsQuery.toString()}`,
+      { headers: backend.headers },
+    );
+    const pinnedFormsResult = await readJsonResponse(pinnedFormsResponse);
+    if (!pinnedFormsResult.ok) return backendErrorResponse(pinnedFormsResult.body);
+    if (!Array.isArray(pinnedFormsResult.body)) {
+      return errorResponse('INTERNAL_ERROR');
+    }
+
+    const pinnedForms = await Promise.all(
+      pinnedFormsResult.body.map(async (form: Record<string, unknown>) => {
+        if (
+          typeof form.form_key !== 'string' ||
+          typeof form.form_version !== 'number' ||
+          typeof form.activation_status !== 'string'
+        ) {
+          return null;
+        }
+        const definitionQuery = new URLSearchParams({
+          select: 'definition',
+          form_key: `eq.${form.form_key}`,
+          version: `eq.${form.form_version}`,
+        });
+        const definitionResponse = await fetch(
+          `${backend.url}/rest/v1/form_definitions?${definitionQuery.toString()}`,
+          { headers: backend.headers },
+        );
+        const definitionResult = await readJsonResponse(definitionResponse);
+        if (!definitionResult.ok) {
+          throw new Error('PINNED_FORM_DEFINITION_UNAVAILABLE');
+        }
+        const row = Array.isArray(definitionResult.body)
+          ? definitionResult.body[0] as Record<string, unknown> | undefined
+          : null;
+        return {
+          form_key: form.form_key,
+          activation_status: form.activation_status,
+          definition: row?.definition,
+        };
+      }),
+    );
+    if (pinnedForms.some((form) => form === null)) {
+      return errorResponse('INTERNAL_ERROR');
+    }
+
+    const answersQuery = new URLSearchParams({
+      select: 'form_key,field_key,value,answer_state',
+      incident_revision_id: `eq.${parsed.data.incident_revision_id}`,
       order: 'updated_at.desc',
     });
     const answersResponse = await fetch(
@@ -100,12 +153,21 @@ Deno.serve(async (req) => {
       return errorResponse('INTERNAL_ERROR');
     }
 
-    const answers: Record<string, unknown[]> = Object.create(null);
-    for (const answer of answersResult.body) {
-      if (typeof answer?.field_key !== 'string') continue;
-      (answers[answer.field_key] ??= []).push(answer.value);
-    }
-    return jsonResponse(selectNextQuestion(graphRecord, answers));
+    const answerContext = buildInterviewAnswerContext(answersResult.body);
+    const preparedGraph = prepareInterviewGraph(
+      graphRecord,
+      pinnedForms as {
+        form_key: string;
+        activation_status: string;
+        definition: unknown;
+      }[],
+      answerContext.confirmedAnswersByForm,
+    );
+    return jsonResponse(selectNextQuestion(
+      preparedGraph,
+      answerContext.confirmedAnswers,
+      answerContext.persistedAnswerKeys,
+    ));
   } catch {
     return errorResponse('RETRYABLE_FAILURE');
   }

@@ -1,11 +1,13 @@
 import { z } from 'zod';
 
+import { postgresUuidSchema } from '../../lib/postgresUuid';
+
 const tripRowSchema = z.object({
-  id: z.string().uuid(),
+  id: postgresUuidSchema,
   started_at: z.string().nullable(),
   route: z.unknown(),
   purpose: z.string().nullable(),
-  vehicle_id: z.string().uuid().nullable(),
+  vehicle_id: postgresUuidSchema.nullable(),
   dvir_summary: z.unknown(),
 });
 

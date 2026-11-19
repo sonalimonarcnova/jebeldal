@@ -42,6 +42,119 @@ function valuesFor(answers, key) {
   return value == null ? [] : [normalize(value)];
 }
 
+function findScalarFields(definition, key) {
+  const matches = [];
+  const visit = (nodes, insideGroup = false) => {
+    if (!Array.isArray(nodes)) return;
+    for (const node of nodes) {
+      if (!node || typeof node !== 'object' || Array.isArray(node)) continue;
+      const isGroup = node.type === 'repeated_group';
+      if (!insideGroup && !isGroup && node.key === key) matches.push(node);
+      visit(node.fields, insideGroup || isGroup);
+      visit(node.sections, insideGroup || isGroup);
+    }
+  };
+  visit(definition?.fields);
+  visit(definition?.sections);
+  return matches;
+}
+
+function definitionConditionMatches(condition, answers) {
+  if (!condition || typeof condition !== 'object' || Array.isArray(condition)) {
+    return false;
+  }
+  if (Array.isArray(condition.all)) {
+    return condition.all.every((item) => definitionConditionMatches(item, answers));
+  }
+  if (Array.isArray(condition.any)) {
+    return condition.any.some((item) => definitionConditionMatches(item, answers));
+  }
+  const values = answers[condition.field_key] ?? [];
+  if (condition.op === 'exists') {
+    return values.some((value) => value !== null && value !== undefined);
+  }
+  if (condition.op === 'eq') {
+    return values.some((value) =>
+      JSON.stringify(value) === JSON.stringify(condition.value)
+    );
+  }
+  if (condition.op === 'in') {
+    return Array.isArray(condition.values) && values.some((value) =>
+      condition.values.some((candidate) =>
+        JSON.stringify(value) === JSON.stringify(candidate)
+      )
+    );
+  }
+  return false;
+}
+
+export function prepareInterviewGraph(graph, pinnedForms, confirmedAnswersByForm = {}) {
+  const formKeyMap = graph.form_key_map ?? {};
+  const pinnedDefinitions = pinnedForms.filter((form) =>
+    typeof form.form_key === 'string' &&
+    form.definition &&
+    typeof form.definition === 'object'
+  );
+  const nodes = graph.nodes.map((node) => {
+    const sourceFormKeys = typeof node.forms_source === 'string'
+      ? node.forms_source.split(', ').map((name) => formKeyMap[name]).filter(Boolean)
+      : [];
+    const candidates = node.form_key
+      ? pinnedDefinitions.filter((form) => form.form_key === node.form_key)
+      : pinnedDefinitions.filter((form) => sourceFormKeys.includes(form.form_key));
+    const matches = candidates.flatMap((form) => {
+      const fields = findScalarFields(form.definition, node.key);
+      return fields.length === 1 ? [{ form, field: fields[0] }] : [];
+    });
+    const match = matches.length === 1 ? matches[0] : null;
+    const safetyCritical = node.key === 'injuries';
+    const formAnswers = match ? confirmedAnswersByForm[match.form.form_key] ?? {} : {};
+    const conditionallyRequired = match?.field.requiredWhen
+      ? definitionConditionMatches(match.field.requiredWhen, formAnswers)
+      : false;
+    const required = safetyCritical || match?.field.required === true || conditionallyRequired;
+    const answerStates = match
+      ? ['confirmed', 'unknown', 'declined', 'pending_follow_up']
+      : [];
+    if (
+      match &&
+      !required &&
+      typeof node.quick_reply === 'string' &&
+      normalize(node.quick_reply) === 'not_applicable'
+    ) {
+      answerStates.push('not_applicable');
+    }
+    return {
+      ...node,
+      form_key: match?.form.form_key ?? null,
+      required,
+      answer_states: answerStates,
+    };
+  });
+  return { ...graph, nodes };
+}
+
+export function buildInterviewAnswerContext(answerRows) {
+  const confirmedAnswers = Object.create(null);
+  const confirmedAnswersByForm = Object.create(null);
+  const persistedAnswerKeys = new Set();
+  for (const answer of answerRows) {
+    if (
+      !answer ||
+      typeof answer.form_key !== 'string' ||
+      typeof answer.field_key !== 'string'
+    ) {
+      continue;
+    }
+    persistedAnswerKeys.add(JSON.stringify([answer.form_key, answer.field_key]));
+    if (answer.answer_state !== 'confirmed') continue;
+    (confirmedAnswers[answer.field_key] ??= []).push(answer.value);
+    const formAnswers = confirmedAnswersByForm[answer.form_key] ??= Object.create(null);
+    (formAnswers[answer.field_key] ??= []).push(answer.value);
+  }
+  return { confirmedAnswers, confirmedAnswersByForm, persistedAnswerKeys };
+}
+
 function hasValue(answers, key, ...expected) {
   const actual = valuesFor(answers, key);
   const normalizedExpected = expected.map(normalize);
@@ -121,7 +234,7 @@ export function evaluateInterviewCondition(condition, answers) {
   }
 }
 
-export function selectNextQuestion(graph, answers) {
+export function selectNextQuestion(graph, answers, persistedAnswerKeys = null) {
   const nodes = [...graph.nodes].sort((left, right) =>
     left.sequence - right.sequence
   );
@@ -130,7 +243,14 @@ export function selectNextQuestion(graph, answers) {
   );
   const answeredKeys = new Set(Object.keys(answers));
   const eligible = nodes.filter((node) => {
-    if (answeredKeys.has(node.key)) return false;
+    if (persistedAnswerKeys instanceof Set) {
+      if (
+        node.form_key &&
+        persistedAnswerKeys.has(JSON.stringify([node.form_key, node.key]))
+      ) return false;
+    } else if (answeredKeys.has(node.key)) {
+      return false;
+    }
     if (!node.condition_key) return node.show_if_source === 'always';
     const condition = conditionByKey.get(node.condition_key);
     return evaluateInterviewCondition(condition, answers);
@@ -140,11 +260,15 @@ export function selectNextQuestion(graph, answers) {
     selected_question: selected
       ? {
         key: selected.key,
+        field_key: selected.key,
+        form_key: selected.form_key ?? null,
         prompt: selected.prompt,
         ui_type: selected.ui_type,
         options: selected.options ?? [],
         section: selected.section,
         sequence: selected.sequence,
+        required: selected.required === true,
+        answer_states: selected.answer_states ?? [],
       }
       : null,
     eligible_keys: eligible.map((node) => node.key),

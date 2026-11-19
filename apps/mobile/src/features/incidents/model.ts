@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { persistedAnswerStates } from './rpcOperations';
 
 const incidentRowSchema = z.object({
   id: z.string().uuid(),
@@ -24,7 +25,7 @@ const answerRowSchema = z.object({
   incident_revision_id: z.string().uuid(),
   field_key: z.string(),
   value: z.unknown(),
-  answer_state: z.enum(['confirmed', 'unknown', 'declined', 'not_applicable', 'pending_follow_up']),
+  answer_state: z.enum(persistedAnswerStates),
 });
 
 const revisionFormRowSchema = z.object({

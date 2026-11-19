@@ -1,6 +1,16 @@
 import { router, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ScrollView, StyleSheet, View } from 'react-native';
+import {
+  Alert,
+  Image,
+  Platform,
+  ScrollView,
+  StyleSheet,
+  View,
+  type ScrollViewInstance,
+} from 'react-native';
+import * as ImagePicker from 'expo-image-picker';
+import * as LocalAuthentication from 'expo-local-authentication';
 import {
   ActivityIndicator,
   Button,
@@ -8,6 +18,7 @@ import {
   Checkbox,
   Chip,
   HelperText,
+  ProgressBar,
   Text,
   TextInput,
 } from 'react-native-paper';
@@ -20,6 +31,7 @@ import {
   questionAnswerText,
   type InterviewQuestion,
 } from '../../src/features/incidents/questionFlow';
+import type { PersistedAnswerState } from '../../src/features/incidents/rpcOperations';
 import {
   processIncidentTextTurn,
   selectNextQuestion,
@@ -35,6 +47,7 @@ import {
 } from '../../src/features/incidents/draftRecovery';
 import {
   formFieldId,
+  groupedFormFieldId,
   getFieldPrompt,
   initialFieldValue,
   validateFieldValue,
@@ -43,27 +56,175 @@ import {
 } from '../../src/features/incidents/formDefinition';
 import {
   loadIncidentDraft,
+  checkIncidentSubmissionReadiness,
+  createIncidentAnswerGroup,
+  createIncidentEvidence,
+  deleteIncidentAnswerGroup,
+  finalizeIncidentEvidence,
+  saveIncidentDetails,
   saveIncidentFieldAnswer,
+  submitIncident,
+  uploadIncidentEvidenceFile,
+  type IncidentAnswer,
+  type IncidentAnswerGroup,
   type IncidentDraft,
+  type IncidentEvidence,
   type IncidentForm,
 } from '../../src/features/incidents/repository';
+import { formatLocation } from '../../src/features/incidents/model';
+import {
+  clearCachedDraftEdits,
+  readCachedDraftEdits,
+  resolveCachedDraftEdits,
+  writeCachedDraftEdits,
+  type DraftEditRecovery,
+} from '../../src/features/incidents/draftEditCache';
+import {
+  clearPendingSubmission,
+  createSignatureReference,
+  readPendingSubmission,
+  writePendingSubmission,
+  type PendingSubmission,
+} from '../../src/features/incidents/submissionCache';
+import type { SubmitIssue } from '../../src/features/incidents/rpcOperations';
 
 type FieldValues = Record<string, unknown>;
 type DirtyFields = Record<string, boolean>;
+type PhotoUploadState = {
+  uri: string;
+  contentType: string;
+  status: 'uploading' | 'failed' | 'uploaded';
+};
+
+const occurredAtFieldId = '__incident_details:occurred_at';
+const locationFieldId = '__incident_details:location';
 
 function getFieldValues(draft: IncidentDraft): FieldValues {
-  const values: FieldValues = {};
+  const values: FieldValues = {
+    [occurredAtFieldId]: toLocalDateTimeInput(draft.occurredAt),
+    [locationFieldId]: formatLocation(draft.location) ?? '',
+  };
   for (const form of draft.forms) {
-    for (const field of form.definition?.fields ?? []) {
+    for (const field of form.definition?.fields.filter((candidate) => candidate.groupKey === null) ?? []) {
       const answer = draft.answers.find(
         (candidate) => candidate.formKey === form.formKey
           && candidate.fieldKey === field.key
+          && candidate.groupInstanceId === null
           && candidate.answerState === 'confirmed',
       );
       values[formFieldId(form.formKey, field.key)] = initialFieldValue(field, answer?.value ?? null);
     }
   }
+  for (const group of draft.groups) {
+    const form = draft.forms.find((candidate) => candidate.formKey === group.formKey);
+    for (const field of form?.definition?.fields.filter((candidate) => candidate.groupKey === group.groupKey) ?? []) {
+      const answer = draft.answers.find(
+        (candidate) => candidate.formKey === group.formKey
+          && candidate.fieldKey === field.key
+          && candidate.groupInstanceId === group.id
+          && candidate.answerState === 'confirmed',
+      );
+      values[groupedFormFieldId(group.formKey, field.key, group.id)] = initialFieldValue(
+        field,
+        answer?.value ?? null,
+      );
+    }
+  }
   return values;
+}
+
+function toLocalDateTimeInput(value: string | null): string {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function answerIdentity(answer: IncidentAnswer): string {
+  return JSON.stringify([answer.formKey, answer.fieldKey, answer.groupInstanceId]);
+}
+
+function parseAnswerFieldId(fieldId: string): [string, string, string?] | null {
+  try {
+    const parsed: unknown = JSON.parse(fieldId);
+    if (
+      Array.isArray(parsed)
+      && typeof parsed[0] === 'string'
+      && typeof parsed[1] === 'string'
+      && (parsed[2] === undefined || typeof parsed[2] === 'string')
+    ) {
+      return parsed as [string, string, string?];
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function displayConflictValue(field: FormFieldDefinition | null, value: unknown): string {
+  if (field) return displayAnswer(field, value);
+  if (value === null || value === undefined || value === '') return 'No value';
+  return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
+    ? String(value)
+    : JSON.stringify(value);
+}
+
+function findAnswerField(
+  draft: IncidentDraft,
+  formKey: string,
+  fieldKey: string,
+  groupInstanceId: string | null,
+): FormFieldDefinition | null {
+  const form = draft.forms.find((candidate) => candidate.formKey === formKey);
+  const groupKey = groupInstanceId
+    ? draft.groups.find((group) => group.id === groupInstanceId)?.groupKey ?? null
+    : null;
+  return form?.definition?.fields.find(
+    (field) => field.key === fieldKey && field.groupKey === groupKey,
+  ) ?? null;
+}
+
+function answerValueId(formKey: string, fieldKey: string, groupInstanceId: string | null): string {
+  return groupInstanceId
+    ? groupedFormFieldId(formKey, fieldKey, groupInstanceId)
+    : formFieldId(formKey, fieldKey);
+}
+
+function locationValue(existing: unknown, label: string): FormJsonValue | null {
+  if (!label.trim()) return null;
+  const previous = typeof existing === 'object' && existing !== null && !Array.isArray(existing)
+    ? existing as Record<string, unknown>
+    : {};
+  return { ...previous, label: label.trim() } as FormJsonValue;
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
+}
+
+function issueLabel(issue: SubmitIssue, draft: IncidentDraft): string {
+  const field = issue.formKey && issue.fieldKey
+    ? findAnswerField(draft, issue.formKey, issue.fieldKey, issue.groupInstanceId)
+    : null;
+  const fieldLabel = issue.label
+    ?? (field ? getFieldPrompt(field) : issue.fieldKey ?? 'Report requirement');
+  return `${fieldLabel} · ${issue.code.replaceAll('_', ' ').toLocaleLowerCase('en')}`;
+}
+
+function issueActionLabel(action: string | null): string | null {
+  switch (action) {
+    case 'capture_or_upload_evidence':
+      return 'Capture or upload evidence';
+    case 'add_group_entry':
+      return 'Add the required repeated item';
+    case 'answer_field':
+      return 'Complete this field';
+    case 'refresh_form_definitions':
+      return 'Refresh pinned form definitions';
+    default:
+      return action;
+  }
 }
 
 function formTitle(form: IncidentForm): string {
@@ -74,6 +235,21 @@ function formTitle(form: IncidentForm): string {
 function valuesEqual(field: FormFieldDefinition, value: unknown, savedValue: unknown): boolean {
   const parsed = validateFieldValue(field, value);
   return parsed.ok && JSON.stringify(parsed.value) === JSON.stringify(savedValue ?? null);
+}
+
+function answerStateLabel(answerState: PersistedAnswerState): string {
+  switch (answerState) {
+    case 'confirmed':
+      return 'Confirmed';
+    case 'unknown':
+      return 'Unknown';
+    case 'declined':
+      return 'Declined';
+    case 'not_applicable':
+      return 'Not applicable';
+    case 'pending_follow_up':
+      return 'Pending follow-up';
+  }
 }
 
 function displayAnswer(field: FormFieldDefinition, value: unknown): string {
@@ -94,6 +270,13 @@ function displayAnswer(field: FormFieldDefinition, value: unknown): string {
   }
   return String(value);
 }
+
+const answerStateActions: Partial<Record<PersistedAnswerState, string>> = {
+  unknown: 'I don’t know',
+  declined: 'Prefer not to answer',
+  not_applicable: 'Not applicable',
+  pending_follow_up: 'Follow up later',
+};
 
 function IncidentFieldEditor({
   field,
@@ -239,6 +422,7 @@ export default function IncidentDraftRoute() {
   const [loading, setLoading] = useState(true);
   const [savingFieldId, setSavingFieldId] = useState<string | null>(null);
   const [cacheConflict, setCacheConflict] = useState<DraftCacheConflict | null>(null);
+  const [editCacheConflict, setEditCacheConflict] = useState<DraftEditRecovery>({ kind: 'none' });
   const [needsRefresh, setNeedsRefresh] = useState(false);
   const [localMessage, setLocalMessage] = useState<string | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
@@ -250,11 +434,33 @@ export default function IncidentDraftRoute() {
   const [questionAnswer, setQuestionAnswer] = useState<unknown>('');
   const [submittingTurn, setSubmittingTurn] = useState(false);
   const [turnMessage, setTurnMessage] = useState<string | null>(null);
+  const [detailMessage, setDetailMessage] = useState<string | null>(null);
+  const [photoError, setPhotoError] = useState<string | null>(null);
+  const [photoUploads, setPhotoUploads] = useState<Record<string, PhotoUploadState>>({});
+  const [photoBusy, setPhotoBusy] = useState(false);
+  const [creatingGroup, setCreatingGroup] = useState<string | null>(null);
+  const [deletingGroup, setDeletingGroup] = useState<string | null>(null);
+  const [historyAnswerId, setHistoryAnswerId] = useState<string | null>(null);
+  const [pendingSubmission, setPendingSubmission] = useState<PendingSubmission | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [submitIssues, setSubmitIssues] = useState<SubmitIssue[]>([]);
+  const [readinessVersion, setReadinessVersion] = useState<number | null>(null);
+  const [readinessMessage, setReadinessMessage] = useState<string | null>(null);
+  const [readinessLoading, setReadinessLoading] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const dirtyFieldsRef = useRef<DirtyFields>({});
+  const fieldValuesRef = useRef<FieldValues>({});
   const savedValuesRef = useRef<FieldValues>({});
   const draftRef = useRef<IncidentDraft | null>(draft);
   const pendingTurnRef = useRef<{ questionId: string; text: string; clientTurnId: string } | null>(null);
+  const scrollRef = useRef<ScrollViewInstance | null>(null);
+  const historyOffsetRef = useRef(0);
+  const submitInFlightRef = useRef(false);
   draftRef.current = draft;
+
+  useEffect(() => {
+    fieldValuesRef.current = fieldValues;
+  }, [fieldValues]);
 
   const replaceDirtyFields = (next: DirtyFields) => {
     dirtyFieldsRef.current = next;
@@ -271,6 +477,42 @@ export default function IncidentDraftRoute() {
     replaceDirtyFields(next);
   };
 
+  const persistCurrentEdits = async (
+    expectedVersion: number,
+    values: FieldValues = fieldValuesRef.current,
+  ) => {
+    if (!revisionId || !session?.user.id) return;
+    const dirtyIds = Object.keys(dirtyFieldsRef.current)
+      .filter((fieldId) => dirtyFieldsRef.current[fieldId]);
+    await writeCachedDraftEdits(session.user.id, revisionId, {
+      expectedVersion,
+      dirtyFieldIds: dirtyIds,
+      values: Object.fromEntries(dirtyIds.map((fieldId) => [fieldId, values[fieldId]])),
+    });
+  };
+
+  const updateLocalFieldValue = (fieldId: string, value: unknown) => {
+    fieldValuesRef.current = { ...fieldValuesRef.current, [fieldId]: value };
+    setFieldValues((current) => ({ ...current, [fieldId]: value }));
+  };
+
+  const refreshDraftPreservingDirty = async (): Promise<IncidentDraft> => {
+    if (!revisionId) throw new Error('An incident revision is required.');
+    const refreshedDraft = await loadIncidentDraft(revisionId);
+    const refreshedValues = getFieldValues(refreshedDraft);
+    savedValuesRef.current = refreshedValues;
+    setDraft(refreshedDraft);
+    setFieldValues((current) => {
+      const next = { ...refreshedValues };
+      for (const [fieldId, dirty] of Object.entries(dirtyFieldsRef.current)) {
+        if (dirty) next[fieldId] = current[fieldId];
+      }
+      fieldValuesRef.current = next;
+      return next;
+    });
+    return refreshedDraft;
+  };
+
   const loadDraft = useCallback(async (): Promise<boolean> => {
     if (!revisionId || !session?.user.id) {
       setErrorText('A signed-in driver and incident revision are required.');
@@ -282,11 +524,20 @@ export default function IncidentDraftRoute() {
     setErrorText(null);
     try {
       const remoteDraft = await loadIncidentDraft(revisionId);
+      const cachedEdits = await readCachedDraftEdits(session.user.id, revisionId);
+      const editRecovery = resolveCachedDraftEdits(
+        cachedEdits,
+        remoteDraft.version,
+        remoteDraft.status === 'submitted',
+      );
       const cachedDraft = remoteDraft.fieldKey
         ? await readCachedDraftText(session.user.id, revisionId, remoteDraft.fieldKey)
         : null;
       const recovery = resolveCachedDraftText(cachedDraft, remoteDraft);
-      const nextValues = getFieldValues(remoteDraft);
+      const serverValues = getFieldValues(remoteDraft);
+      const nextValues = editRecovery.kind === 'none'
+        ? serverValues
+        : { ...serverValues, ...editRecovery.values };
       const narrativeId = remoteDraft.fieldKey && remoteDraft.narrativeFormKey
         ? formFieldId(remoteDraft.narrativeFormKey, remoteDraft.fieldKey)
         : null;
@@ -296,12 +547,10 @@ export default function IncidentDraftRoute() {
 
       setLocalMessage(null);
       setCacheConflict(null);
+      setEditCacheConflict(editRecovery.kind === 'conflict' ? editRecovery : { kind: 'none' });
       setNeedsRefresh(false);
       setDraft(remoteDraft);
-      savedValuesRef.current = nextValues;
-      if (narrativeId) {
-        nextValues[narrativeId] = remoteDraft.narrative;
-      }
+      savedValuesRef.current = serverValues;
 
       if (recovery.kind === 'conflict' || submittedLocalDifference) {
         const conflict = recovery.kind === 'conflict'
@@ -312,20 +561,56 @@ export default function IncidentDraftRoute() {
             expectedVersion: cachedDraft?.expectedVersion ?? remoteDraft.version,
             currentVersion: remoteDraft.version,
           };
-        setFieldValues(nextValues);
-        replaceDirtyFields({});
+        const displayedValues = {
+          ...nextValues,
+          ...(narrativeId ? { [narrativeId]: conflict.serverText } : {}),
+        };
+        fieldValuesRef.current = displayedValues;
+        setFieldValues(displayedValues);
         setCacheConflict(conflict);
-        setLocalMessage('The local and server copies differ. Choose which copy to keep before editing.');
+        setLocalMessage('The local and server narrative copies differ. Choose which copy to keep before editing.');
       } else if (recovery.kind === 'restore' && narrativeId && remoteDraft.fieldKey) {
         nextValues[narrativeId] = recovery.text;
+        fieldValuesRef.current = nextValues;
         setFieldValues(nextValues);
-        replaceDirtyFields(recovery.dirty ? { [narrativeId]: true } : {});
         if (recovery.dirty) {
           setLocalMessage('Unsaved text was restored from this device. Save it to sync with the report.');
         }
       } else {
+        fieldValuesRef.current = nextValues;
         setFieldValues(nextValues);
-        replaceDirtyFields({});
+      }
+      const restoredDirtyFields: DirtyFields = editRecovery.kind === 'none'
+        ? {}
+        : Object.fromEntries(editRecovery.dirtyFieldIds.map((fieldId) => [fieldId, true]));
+      if (recovery.kind === 'restore' && recovery.dirty && narrativeId) {
+        restoredDirtyFields[narrativeId] = true;
+      }
+      replaceDirtyFields(restoredDirtyFields);
+
+      const pending = await readPendingSubmission(session.user.id, revisionId);
+      if (
+        pending
+        && (remoteDraft.status === 'submitted' || pending.expectedVersion !== remoteDraft.version)
+      ) {
+        await clearPendingSubmission(session.user.id, revisionId);
+        setPendingSubmission(null);
+        if (remoteDraft.status === 'submitted') {
+          setSubmitError(null);
+        } else {
+          setSubmitError('The draft changed after the last confirmation attempt. Your report is still a draft; review and confirm again.');
+        }
+      } else {
+        setPendingSubmission(pending);
+      }
+      if (editRecovery.kind === 'conflict') {
+        setLocalMessage(
+          remoteDraft.status === 'submitted'
+            ? 'Unsaved edits from this device are read-only and have not changed the submitted report.'
+            : 'Unsaved edits were preserved. Choose which copy to keep before saving against the newer revision.',
+        );
+      } else if (editRecovery.kind === 'restore') {
+        setLocalMessage('Unsaved edits were restored from this device. Save them to sync with the report.');
       }
       return true;
     } catch (error) {
@@ -387,6 +672,100 @@ export default function IncidentDraftRoute() {
     session?.user.id,
   ]);
 
+  useEffect(() => {
+    if (
+      !draft
+      || draft.status !== 'draft'
+      || !revisionId
+      || !session?.user.id
+      || editCacheConflict.kind === 'conflict'
+      || cacheConflict
+    ) {
+      return;
+    }
+
+    const persist = () => {
+      const dirtyIds = Object.keys(dirtyFieldsRef.current)
+        .filter((fieldId) => dirtyFieldsRef.current[fieldId]);
+      const values = Object.fromEntries(
+        dirtyIds.map((fieldId) => [fieldId, fieldValuesRef.current[fieldId]]),
+      );
+      return writeCachedDraftEdits(session.user.id, revisionId, {
+        expectedVersion: draft.version,
+        dirtyFieldIds: dirtyIds,
+        values,
+      });
+    };
+    const timeout = setTimeout(() => {
+      void persist().catch((error: unknown) => {
+        setErrorText(errorMessage(error, 'Could not preserve unsaved form edits on this device.'));
+      });
+    }, 250);
+    return () => {
+      clearTimeout(timeout);
+      void persist().catch(() => undefined);
+    };
+  }, [
+    cacheConflict,
+    draft,
+    dirtyFields,
+    editCacheConflict,
+    revisionId,
+    session?.user.id,
+  ]);
+
+  const keepUnsavedEdits = async () => {
+    if (
+      editCacheConflict.kind !== 'conflict'
+      || !draft
+      || draft.status !== 'draft'
+      || !revisionId
+      || !session?.user.id
+    ) {
+      return;
+    }
+    try {
+      await writeCachedDraftEdits(session.user.id, revisionId, {
+        expectedVersion: draft.version,
+        dirtyFieldIds: editCacheConflict.dirtyFieldIds,
+        values: editCacheConflict.values,
+      });
+      const restoredValues = { ...fieldValuesRef.current, ...editCacheConflict.values };
+      fieldValuesRef.current = restoredValues;
+      setFieldValues(restoredValues);
+      replaceDirtyFields({
+        ...dirtyFieldsRef.current,
+        ...Object.fromEntries(editCacheConflict.dirtyFieldIds.map((fieldId) => [fieldId, true])),
+      });
+      setEditCacheConflict({ kind: 'none' });
+      setLocalMessage('Your local edits are preserved against the current revision. Review and save each changed field.');
+    } catch (error) {
+      setErrorText(errorMessage(error, 'Could not preserve the local edits.'));
+    }
+  };
+
+  const useServerEdits = async () => {
+    if (
+      editCacheConflict.kind !== 'conflict'
+      || !revisionId
+      || !session?.user.id
+    ) {
+      return;
+    }
+    const nextValues = { ...fieldValuesRef.current };
+    const nextDirty = { ...dirtyFieldsRef.current };
+    for (const fieldId of editCacheConflict.dirtyFieldIds) {
+      nextValues[fieldId] = savedValuesRef.current[fieldId];
+      delete nextDirty[fieldId];
+    }
+    await clearCachedDraftEdits(session.user.id, revisionId);
+    fieldValuesRef.current = nextValues;
+    setFieldValues(nextValues);
+    replaceDirtyFields(nextDirty);
+    setEditCacheConflict({ kind: 'none' });
+    setLocalMessage('The current server values were kept; unsaved local edits were discarded.');
+  };
+
   const keepLocalCopy = async () => {
     if (!cacheConflict || !draft?.fieldKey || !narrativeId || !revisionId || !session?.user.id) {
       return;
@@ -402,7 +781,7 @@ export default function IncidentDraftRoute() {
         cacheConflict.localText,
         draft.version,
       );
-      setFieldValues((current) => ({ ...current, [narrativeId]: cacheConflict.localText }));
+      updateLocalFieldValue(narrativeId, cacheConflict.localText);
       markFieldDirty(narrativeId, cacheConflict.localText.trim() !== draft.narrative);
       setCacheConflict(null);
       setLocalMessage('Local text kept. Save its answer to replace the current server copy.');
@@ -427,7 +806,8 @@ export default function IncidentDraftRoute() {
     setErrorText(null);
     try {
       await clearCachedDraftText(session.user.id, revisionId, draft.fieldKey);
-      const nextValues = { ...fieldValues, [narrativeId]: cacheConflict.serverText };
+      const nextValues = { ...fieldValuesRef.current, [narrativeId]: cacheConflict.serverText };
+      fieldValuesRef.current = nextValues;
       setFieldValues(nextValues);
       savedValuesRef.current = { ...savedValuesRef.current, [narrativeId]: cacheConflict.serverText };
       markFieldDirty(narrativeId, false);
@@ -444,9 +824,14 @@ export default function IncidentDraftRoute() {
     }
   };
 
-  const changeFieldValue = (form: IncidentForm, field: FormFieldDefinition, value: unknown) => {
-    const fieldId = formFieldId(form.formKey, field.key);
-    setFieldValues((current) => ({ ...current, [fieldId]: value }));
+  const changeAnswerValue = (
+    form: IncidentForm,
+    field: FormFieldDefinition,
+    value: unknown,
+    groupInstanceId: string | null,
+  ) => {
+    const fieldId = answerValueId(form.formKey, field.key, groupInstanceId);
+    updateLocalFieldValue(fieldId, value);
     setFieldErrors((current) => {
       const next = { ...current };
       delete next[fieldId];
@@ -456,12 +841,16 @@ export default function IncidentDraftRoute() {
     setSaveMessage(null);
   };
 
-  const saveField = async (form: IncidentForm, field: FormFieldDefinition) => {
+  const saveField = async (
+    form: IncidentForm,
+    field: FormFieldDefinition,
+    groupInstanceId: string | null = null,
+  ) => {
     if (!draft || !revisionId || !session?.user.id || field.configurationError) {
       return;
     }
 
-    const fieldId = formFieldId(form.formKey, field.key);
+    const fieldId = answerValueId(form.formKey, field.key, groupInstanceId);
     if (fieldId !== narrativeId && narrativeDirty) {
       setErrorText('Save the incident narrative first so this answer uses the same server revision.');
       return;
@@ -486,10 +875,13 @@ export default function IncidentDraftRoute() {
         field.key,
         parsed.value as FormJsonValue,
         draft.version,
+        'confirmed',
+        groupInstanceId,
       );
       setDraft((current) => current ? { ...current, version: nextVersion } : current);
       markFieldDirty(fieldId, false);
       savedValuesRef.current = { ...savedValuesRef.current, [fieldId]: parsed.value };
+      await persistCurrentEdits(nextVersion);
 
       let cacheCleanupError: string | null = null;
       if (fieldId === narrativeId && draft.fieldKey) {
@@ -514,6 +906,7 @@ export default function IncidentDraftRoute() {
               next[dirtyId] = current[dirtyId];
             }
           }
+          fieldValuesRef.current = next;
           return next;
         });
         setSaveMessage(
@@ -645,6 +1038,7 @@ export default function IncidentDraftRoute() {
       pendingTurnRef.current = null;
       setDraft((current) => current ? { ...current, version: nextVersion } : current);
       markFieldDirty(fieldId, false);
+      await persistCurrentEdits(nextVersion);
       let cacheCleanupError: string | null = null;
       if (fieldId === narrativeId && draft.fieldKey) {
         try {
@@ -665,6 +1059,7 @@ export default function IncidentDraftRoute() {
               next[dirtyId] = current[dirtyId];
             }
           }
+          fieldValuesRef.current = next;
           return next;
         });
         setTurnMessage(cacheCleanupError ?? 'Turn accepted and answer saved.');
@@ -697,42 +1092,438 @@ export default function IncidentDraftRoute() {
     }
   };
 
-  const skipUnmappedQuestion = async () => {
-    if (!nextQuestion || !revisionId) {
+  const saveInterviewAnswerState = async (answerState: PersistedAnswerState) => {
+    if (
+      !draft ||
+      !nextQuestion ||
+      !revisionId ||
+      !nextQuestion.answerStates.includes(answerState)
+    ) {
       return;
     }
-    setQuestionLoading(true);
+    const mapping = findPinnedQuestionMapping(nextQuestion, draft.forms);
+    if (!mapping) {
+      setQuestionError('This graph node has no unique active pinned-field mapping and cannot save an answer status.');
+      return;
+    }
+    const fieldId = formFieldId(mapping.formKey, nextQuestion.fieldKey);
+    if (dirtyFieldsRef.current[fieldId]) {
+      setQuestionError('Save or discard this field’s current edit before recording a response status.');
+      return;
+    }
+    if (fieldId === narrativeId && narrativeDirty) {
+      setQuestionError('Save the incident narrative first so this status uses the current server revision.');
+      return;
+    }
+    setSubmittingTurn(true);
     setQuestionError(null);
+    setTurnMessage(null);
     try {
-      const result = await selectNextQuestion(revisionId);
-      if (result.kind === 'complete') {
-        setNextQuestion(null);
-        setInterviewComplete(true);
-      } else if (
-        result.question.formKey === nextQuestion.formKey
-        && result.question.fieldKey === nextQuestion.fieldKey
-      ) {
-        setQuestionError(
-          'The server selected this question again. The current backend contract does not record skipped questions, so it cannot advance past this item yet.',
-        );
-      } else {
-        setNextQuestion(result.question);
-        const field = draft
-          ? findPinnedQuestionMapping(result.question, draft.forms)?.field ?? null
-          : null;
-        setQuestionAnswer(field ? initialFieldValue(field, null) : '');
+      const nextVersion = await saveIncidentFieldAnswer(
+        draft,
+        mapping.formKey,
+        nextQuestion.fieldKey,
+        null,
+        draft.version,
+        answerState,
+      );
+      await persistCurrentEdits(nextVersion);
+      const refreshedDraft = await loadIncidentDraft(revisionId);
+      const refreshedValues = getFieldValues(refreshedDraft);
+      savedValuesRef.current = refreshedValues;
+      setDraft(refreshedDraft);
+      setFieldValues((current) => {
+        const next = { ...refreshedValues };
+        for (const [dirtyId, dirty] of Object.entries(dirtyFieldsRef.current)) {
+          if (dirty) next[dirtyId] = current[dirtyId];
+        }
+        fieldValuesRef.current = next;
+        return next;
+      });
+      setTurnMessage(
+        `${answerStateLabel(answerState)} saved. The planner will continue without treating it as a confirmed fact.`,
+      );
+      setSaveMessage(null);
+      if (nextVersion !== refreshedDraft.version) {
+        setNeedsRefresh(true);
+        setQuestionError('The answer state was saved, but the revision changed again. Reload before continuing.');
       }
     } catch (error) {
-      setQuestionError(
-        error instanceof Error ? error.message : 'Could not request the next question.',
-      );
+      const message = error instanceof Error ? error.message : 'Could not save this answer state.';
+      setQuestionError(message);
+      if (message.includes('changed on the server')) setNeedsRefresh(true);
     } finally {
-      setQuestionLoading(false);
+      setSubmittingTurn(false);
+    }
+  };
+
+  const saveIncidentDetailsEdits = async () => {
+    if (!draft || draft.status !== 'draft' || !revisionId) return;
+    const occurredAtInput = fieldValues[occurredAtFieldId];
+    const locationInput = fieldValues[locationFieldId];
+    const occurredAtText = typeof occurredAtInput === 'string' ? occurredAtInput.trim() : '';
+    const locationText = typeof locationInput === 'string' ? locationInput : '';
+    let occurredAt: string | null = null;
+    if (occurredAtText) {
+      const timestamp = new Date(occurredAtText).getTime();
+      if (!Number.isFinite(timestamp)) {
+        setFieldErrors((current) => ({ ...current, [occurredAtFieldId]: 'Enter a valid local date and time.' }));
+        return;
+      }
+      occurredAt = new Date(timestamp).toISOString();
+    }
+
+    const location = locationValue(draft.location, locationText);
+    setSavingFieldId('incident-details');
+    setDetailMessage(null);
+    setErrorText(null);
+    try {
+      const nextVersion = await saveIncidentDetails(draft, occurredAt, location);
+      markFieldDirty(occurredAtFieldId, false);
+      markFieldDirty(locationFieldId, false);
+      savedValuesRef.current = {
+        ...savedValuesRef.current,
+        [occurredAtFieldId]: toLocalDateTimeInput(occurredAt),
+        [locationFieldId]: locationText.trim(),
+      };
+      await persistCurrentEdits(nextVersion);
+      const refreshed = await refreshDraftPreservingDirty();
+      setDetailMessage(`Occurred time and location saved on revision ${refreshed.version}.`);
+    } catch (error) {
+      const message = errorMessage(error, 'Could not save incident details.');
+      setErrorText(message);
+      if (message.includes('changed on the server')) setNeedsRefresh(true);
+    } finally {
+      setSavingFieldId(null);
+    }
+  };
+
+  const addRepeatedGroup = async (form: IncidentForm, groupKey: string) => {
+    if (!draft || draft.status !== 'draft') return;
+    setCreatingGroup(`${form.formKey}:${groupKey}`);
+    setErrorText(null);
+    try {
+      const position = draft.groups
+        .filter((group) => group.formKey === form.formKey && group.groupKey === groupKey)
+        .reduce((maximum, group) => Math.max(maximum, group.position), -1) + 1;
+      await createIncidentAnswerGroup(draft, form.formKey, groupKey, position);
+      const nextVersion = draft.version + 1;
+      await persistCurrentEdits(nextVersion);
+      await refreshDraftPreservingDirty();
+    } catch (error) {
+      const message = errorMessage(error, 'Could not add this repeated group.');
+      setErrorText(message);
+      if (message.includes('changed on the server')) setNeedsRefresh(true);
+    } finally {
+      setCreatingGroup(null);
+    }
+  };
+
+  const removeRepeatedGroup = async (group: IncidentAnswerGroup) => {
+    if (!draft || draft.status !== 'draft') return;
+    const hasUnsavedGroupValues = Object.entries(dirtyFieldsRef.current).some(([fieldId, dirty]) => {
+      const identity = parseAnswerFieldId(fieldId);
+      return dirty && identity?.[2] === group.id;
+    });
+    if (hasUnsavedGroupValues) {
+      setErrorText('Save or discard this repeated item’s unsaved fields before removing it.');
+      return;
+    }
+
+    setDeletingGroup(group.id);
+    setErrorText(null);
+    try {
+      const nextVersion = await deleteIncidentAnswerGroup(draft, group.id);
+      await persistCurrentEdits(nextVersion);
+      await refreshDraftPreservingDirty();
+    } catch (error) {
+      const message = errorMessage(error, 'Could not remove this repeated item.');
+      setErrorText(message);
+      if (message.includes('changed on the server')) setNeedsRefresh(true);
+    } finally {
+      setDeletingGroup(null);
+    }
+  };
+
+  const confirmRemoveRepeatedGroup = (group: IncidentAnswerGroup, label: string) => {
+    Alert.alert(
+      `Remove ${label}?`,
+      'Saved answers in this item will be deleted from the draft.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Remove', style: 'destructive', onPress: () => void removeRepeatedGroup(group) },
+      ],
+    );
+  };
+
+  const uploadPhoto = async (
+    evidence: Pick<IncidentEvidence, 'id' | 'objectPath'>,
+    uri: string,
+    contentType: string,
+  ) => {
+    setPhotoUploads((current) => ({
+      ...current,
+      [evidence.id]: { uri, contentType, status: 'uploading' },
+    }));
+    try {
+      const response = await fetch(uri);
+      if (!response.ok) throw new Error('The captured photo could not be read from this device.');
+      const blob = await response.blob();
+      await uploadIncidentEvidenceFile(evidence.objectPath, blob, contentType);
+      const finalized = await finalizeIncidentEvidence(evidence.id);
+      if (finalized.uploadStatus !== 'uploaded') {
+        throw new Error('The server could not verify this photo. Capture a replacement or retry the upload.');
+      }
+      setPhotoUploads((current) => ({
+        ...current,
+        [evidence.id]: { uri, contentType, status: 'uploaded' },
+      }));
+      await persistCurrentEdits(finalized.revisionVersion);
+      await refreshDraftPreservingDirty();
+    } catch (error) {
+      setPhotoUploads((current) => ({
+        ...current,
+        [evidence.id]: { uri, contentType, status: 'failed' },
+      }));
+      throw error;
+    }
+  };
+
+  const captureIncidentPhoto = async () => {
+    if (!draft || draft.status !== 'draft') return;
+    if (Platform.OS === 'web') {
+      setPhotoError('Incident photo capture is available on an iOS or Android device.');
+      return;
+    }
+    setPhotoBusy(true);
+    setPhotoError(null);
+    let createdEvidenceId: string | null = null;
+    try {
+      const permission = await ImagePicker.requestCameraPermissionsAsync();
+      if (!permission.granted) {
+        setPhotoError('Camera permission is needed to capture incident evidence. Your draft is unchanged.');
+        return;
+      }
+      const capture = await ImagePicker.launchCameraAsync({
+        mediaTypes: ['images'],
+        quality: 0.8,
+      });
+      if (capture.canceled || !capture.assets[0]) return;
+
+      const asset = capture.assets[0];
+      const response = await fetch(asset.uri);
+      if (!response.ok) throw new Error('The captured photo could not be read from this device.');
+      const blob = await response.blob();
+      if (blob.size <= 0 || blob.size > 50 * 1024 * 1024) {
+        throw new Error('The photo must be smaller than 50 MB. Capture a lower-resolution image and retry.');
+      }
+      const contentType = asset.mimeType ?? blob.type ?? 'image/jpeg';
+      if (!['image/jpeg', 'image/png', 'image/webp'].includes(contentType)) {
+        throw new Error('The captured image format is not supported. Use JPEG, PNG, or WebP.');
+      }
+
+      const evidence = await createIncidentEvidence(
+        draft,
+        blob.size,
+        asset.fileName ?? 'Incident photo',
+      );
+      createdEvidenceId = evidence.evidenceId;
+      setDraft((current) => current ? { ...current, version: evidence.revisionVersion } : current);
+      await persistCurrentEdits(evidence.revisionVersion);
+      await refreshDraftPreservingDirty();
+      await uploadPhoto(
+        { id: evidence.evidenceId, objectPath: evidence.objectPath },
+        asset.uri,
+        contentType,
+      );
+    } catch (error) {
+      if (createdEvidenceId) {
+        try {
+          await refreshDraftPreservingDirty();
+        } catch {
+          // Keep the captured file available for retry even if the status refresh fails.
+        }
+      }
+      setPhotoError(errorMessage(error, 'The incident photo could not be uploaded. Retry without losing the captured image.'));
+    } finally {
+      setPhotoBusy(false);
+    }
+  };
+
+  const retryPhotoUpload = async (evidence: IncidentEvidence) => {
+    const local = photoUploads[evidence.id];
+    if (!local || !draft || draft.status !== 'draft') {
+      setPhotoError('The original image is no longer available on this device. Capture a replacement photo.');
+      return;
+    }
+    setPhotoBusy(true);
+    setPhotoError(null);
+    try {
+      const finalized = await finalizeIncidentEvidence(evidence.id);
+      if (finalized.uploadStatus === 'uploaded') {
+        setPhotoUploads((current) => ({
+          ...current,
+          [evidence.id]: { ...local, status: 'uploaded' },
+        }));
+        await persistCurrentEdits(finalized.revisionVersion);
+        await refreshDraftPreservingDirty();
+        return;
+      }
+      setDraft((current) => current ? { ...current, version: finalized.revisionVersion } : current);
+      await persistCurrentEdits(finalized.revisionVersion);
+      await uploadPhoto(evidence, local.uri, local.contentType);
+    } catch (error) {
+      setPhotoError(errorMessage(error, 'Photo upload failed. Retry when the connection is available.'));
+    } finally {
+      setPhotoBusy(false);
+    }
+  };
+
+  const checkSubmissionReadiness = async () => {
+    if (!draft || draft.status !== 'draft' || !interviewComplete) return;
+    if (
+      Object.values(dirtyFieldsRef.current).some(Boolean)
+      || cacheConflict
+      || editCacheConflict.kind === 'conflict'
+      || needsRefresh
+    ) {
+      setSubmitError('Save or resolve all unsaved edits and reload stale server state before checking readiness.');
+      return;
+    }
+
+    setReadinessLoading(true);
+    setSubmitError(null);
+    setSubmitIssues([]);
+    setReadinessMessage(null);
+    try {
+      const result = await checkIncidentSubmissionReadiness(draft);
+      if (result.revisionId !== draft.revisionId || result.version !== draft.version) {
+        throw new Error('The server checked a different incident revision. Reload before continuing.');
+      }
+      setReadinessVersion(result.version);
+      if (result.kind === 'blocked') {
+        setSubmitIssues(result.issues);
+        setReadinessMessage('The server found requirements that must be completed before device confirmation.');
+      } else {
+        setReadinessMessage('The server reports this revision is ready. Confirm on this device to submit it.');
+      }
+    } catch (error) {
+      setReadinessVersion(null);
+      setSubmitError(errorMessage(error, 'Could not check server readiness.'));
+    } finally {
+      setReadinessLoading(false);
+    }
+  };
+
+  const submitReport = async () => {
+    if (!draft || draft.status !== 'draft' || !revisionId || !session?.user.id) return;
+    if (submitInFlightRef.current) return;
+    if (
+      Object.values(dirtyFieldsRef.current).some(Boolean)
+      || cacheConflict
+      || editCacheConflict.kind === 'conflict'
+      || needsRefresh
+    ) {
+      setSubmitError('Save or resolve all unsaved edits and reload any stale server state before confirming submission.');
+      return;
+    }
+    if (!interviewComplete) {
+      setSubmitError('Complete the server-selected interview questions before submitting.');
+      return;
+    }
+    if (
+      !pendingSubmission
+      && (readinessVersion !== draft.version || submitIssues.length > 0)
+    ) {
+      setSubmitError('Check server readiness for the latest saved revision before confirming submission.');
+      return;
+    }
+    if (pendingSubmission && pendingSubmission.expectedVersion !== draft.version) {
+      setSubmitError('This confirmation belongs to an older revision. Reload the report and confirm again.');
+      return;
+    }
+
+    submitInFlightRef.current = true;
+    setSubmitting(true);
+    setSubmitError(null);
+    setSubmitIssues([]);
+    try {
+      let confirmation = pendingSubmission;
+      if (!confirmation) {
+        if (Platform.OS === 'web') {
+          throw new Error('Confirm submission on an iOS or Android device using its local authentication.');
+        }
+        const securityLevel = await LocalAuthentication.getEnrolledLevelAsync();
+        if (securityLevel === LocalAuthentication.SecurityLevel.NONE) {
+          throw new Error('Set up device biometrics or a device passcode before confirming this report.');
+        }
+        const authMethod = securityLevel === LocalAuthentication.SecurityLevel.SECRET
+          ? 'device_passcode'
+          : 'biometric';
+        const authentication = await LocalAuthentication.authenticateAsync({
+          promptMessage: 'Confirm and submit this incident report',
+          cancelLabel: 'Cancel',
+          disableDeviceFallback: authMethod === 'biometric',
+        });
+        if (!authentication.success) {
+          throw new Error(`Device confirmation was not completed (${authentication.error}). The report is still a draft.`);
+        }
+        confirmation = {
+          signatureReference: createSignatureReference(),
+          expectedVersion: draft.version,
+          authMethod,
+          deviceDescription: `${Platform.OS} ${String(Platform.Version)} device`,
+          createdAt: new Date().toISOString(),
+        };
+        await writePendingSubmission(session.user.id, revisionId, confirmation);
+        setPendingSubmission(confirmation);
+      }
+
+      const result = await submitIncident({
+        p_incident_revision_id: revisionId,
+        p_expected_version: confirmation.expectedVersion,
+        p_signature_reference: confirmation.signatureReference,
+        p_auth_method: confirmation.authMethod,
+        p_device_description: confirmation.deviceDescription,
+      });
+      if (result.kind === 'blocked') {
+        await clearPendingSubmission(session.user.id, revisionId);
+        setPendingSubmission(null);
+        setSubmitIssues(result.issues);
+        setReadinessVersion(result.version);
+        setReadinessMessage('The server found requirements that must be completed before device confirmation.');
+        setSubmitError('The server found requirements that must be completed before submission.');
+        return;
+      }
+      const submittedDraft = await loadIncidentDraft(revisionId);
+      await clearPendingSubmission(session.user.id, revisionId);
+      setPendingSubmission(null);
+      setSubmitError(null);
+      setSubmitIssues([]);
+      setReadinessVersion(null);
+      setReadinessMessage(null);
+      setDraft(submittedDraft);
+      setSaveMessage(`Submitted · awaiting review · reference ${result.reportReference}`);
+    } catch (error) {
+      const message = errorMessage(error, 'Could not submit the incident report.');
+      setSubmitError(message);
+      if (message.includes('changed on the server')) {
+        setNeedsRefresh(true);
+      }
+    } finally {
+      submitInFlightRef.current = false;
+      setSubmitting(false);
     }
   };
 
   const reloadServerForm = async () => {
     if (!draft || !revisionId || !session?.user.id) {
+      return;
+    }
+    try {
+      await persistCurrentEdits(draft.version);
+    } catch (error) {
+      setErrorText(errorMessage(error, 'Could not preserve local edits before reloading.'));
       return;
     }
     if (narrativeDirty && narrativeId && draft.fieldKey) {
@@ -753,7 +1544,7 @@ export default function IncidentDraftRoute() {
     }
     const refreshed = await loadDraft();
     if (refreshed) {
-      setLocalMessage('Server form reloaded. Unsaved non-narrative answers were discarded; the narrative cache was preserved.');
+      setLocalMessage('Server form reloaded. Unsaved edits were preserved for review before saving against the current revision.');
     }
   };
 
@@ -780,19 +1571,46 @@ export default function IncidentDraftRoute() {
   const controlsDisabled = readOnly
     || savingFieldId !== null
     || needsRefresh
-    || cacheConflict !== null;
+    || cacheConflict !== null
+    || editCacheConflict.kind === 'conflict'
+    || readinessLoading
+    || submitting
+    || photoBusy
+    || creatingGroup !== null
+    || deletingGroup !== null;
   const questionMapping = nextQuestion
     ? findPinnedQuestionMapping(nextQuestion, draft.forms)
     : null;
   const questionField = questionMapping?.field ?? null;
-  const questionFieldForm = questionMapping
-    ? draft.forms.find((form) => form.formKey === questionMapping.formKey) ?? null
-    : null;
   const questionUsesFallback = /fallback|rule/i.test(nextQuestion?.selectionSource ?? '');
+  const historyAnswer = historyAnswerId
+    ? draft.answers.find((answer) => answerIdentity(answer) === historyAnswerId) ?? null
+    : null;
+  const historyForm = historyAnswer
+    ? draft.forms.find((form) => form.formKey === historyAnswer.formKey) ?? null
+    : null;
+  const historyField = historyAnswer
+    ? findAnswerField(
+      draft,
+      historyAnswer.formKey,
+      historyAnswer.fieldKey,
+      historyAnswer.groupInstanceId,
+    )
+    : null;
+  const historyValueId = historyAnswer
+    ? answerValueId(historyAnswer.formKey, historyAnswer.fieldKey, historyAnswer.groupInstanceId)
+    : null;
+  const detailsDirty = dirtyFields[occurredAtFieldId] === true || dirtyFields[locationFieldId] === true;
+  const returnToPreviousAnswer = () => {
+    const previousAnswer = draft.answers.at(-1);
+    if (!previousAnswer) return;
+    setHistoryAnswerId(answerIdentity(previousAnswer));
+    setTimeout(() => scrollRef.current?.scrollTo({ y: historyOffsetRef.current, animated: true }), 0);
+  };
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+      <ScrollView ref={scrollRef} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
         <View style={styles.header}>
           <Button onPress={() => router.back()}>Back</Button>
           <Text variant="labelLarge">
@@ -800,8 +1618,124 @@ export default function IncidentDraftRoute() {
           </Text>
         </View>
         {readOnly ? (
-          <Text variant="bodyMedium">Submitted reports are read-only.</Text>
+          <Card>
+            <Card.Content style={styles.cardContent}>
+              <Text variant="titleLarge">Submitted · awaiting review</Text>
+              <Text variant="bodyMedium">This report has been submitted and is read-only.</Text>
+              {draft.reportReference ? (
+                <Text variant="titleMedium">{`Report reference ${draft.reportReference}`}</Text>
+              ) : (
+                <HelperText type="error" visible>
+                  The submitted report reference is unavailable. Retry loading the server report.
+                </HelperText>
+              )}
+              <Text variant="bodySmall">Driver confirmation was recorded on the server. No biometric data is uploaded.</Text>
+            </Card.Content>
+          </Card>
         ) : null}
+        {editCacheConflict.kind === 'conflict' ? (
+          <Card>
+            <Card.Content style={styles.cardContent}>
+              <Text variant="titleMedium">
+                {draft.status === 'submitted' ? 'Unsaved device edits' : 'This report changed on the server'}
+              </Text>
+              <Text variant="bodySmall">
+                {draft.status === 'submitted'
+                  ? 'These edits were never submitted and cannot change the submitted report.'
+                  : `Local edits were saved against revision ${editCacheConflict.expectedVersion}; the server is now at revision ${editCacheConflict.currentVersion}. Compare both copies before saving.`}
+              </Text>
+              {editCacheConflict.dirtyFieldIds.map((fieldId) => {
+                const parts = parseAnswerFieldId(fieldId);
+                const form = parts
+                  ? draft.forms.find((candidate) => candidate.formKey === parts[0])
+                  : null;
+                const field = parts
+                  ? findAnswerField(draft, parts[0], parts[1], parts[2] ?? null)
+                  : null;
+                return (
+                  <View key={`edit-conflict:${fieldId}`} style={styles.field}>
+                    <Text variant="labelLarge">
+                      {field
+                        ? `${formTitle(form as IncidentForm)} · ${getFieldPrompt(field)}`
+                        : fieldId === occurredAtFieldId
+                          ? 'Occurred time'
+                          : fieldId === locationFieldId
+                            ? 'Incident location'
+                            : fieldId}
+                    </Text>
+                    <Text variant="bodySmall">{`Server: ${displayConflictValue(field, savedValuesRef.current[fieldId])}`}</Text>
+                    <Text variant="bodySmall">{`This device: ${displayConflictValue(field, editCacheConflict.values[fieldId])}`}</Text>
+                  </View>
+                );
+              })}
+              {draft.status === 'draft' ? (
+                <Button mode="contained" onPress={() => void keepUnsavedEdits()}>
+                  Keep my unsaved edits
+                </Button>
+              ) : null}
+              <Button mode="outlined" onPress={() => void useServerEdits()}>
+                {draft.status === 'submitted' ? 'Discard unsaved edits' : 'Use current server values'}
+              </Button>
+            </Card.Content>
+          </Card>
+        ) : null}
+        <Card>
+          <Card.Content style={styles.cardContent}>
+            <Text variant="titleMedium">Confirm incident details</Text>
+            <Text variant="bodySmall">
+              Confirm or correct the occurred time and location. Location may be entered manually; GPS is optional.
+            </Text>
+            <TextInput
+              mode="outlined"
+              label="Occurred at (local date and time)"
+              value={typeof fieldValues[occurredAtFieldId] === 'string'
+                ? fieldValues[occurredAtFieldId] as string
+                : ''}
+              onChangeText={(value) => {
+                updateLocalFieldValue(occurredAtFieldId, value);
+                setFieldErrors((current) => ({ ...current, [occurredAtFieldId]: '' }));
+                markFieldDirty(
+                  occurredAtFieldId,
+                  toLocalDateTimeInput(draft.occurredAt) !== value,
+                );
+                setDetailMessage(null);
+              }}
+              disabled={controlsDisabled}
+              placeholder="YYYY-MM-DDTHH:mm"
+            />
+            {fieldErrors[occurredAtFieldId] ? (
+              <HelperText type="error" visible>{fieldErrors[occurredAtFieldId]}</HelperText>
+            ) : null}
+            <TextInput
+              mode="outlined"
+              label="Incident location"
+              value={typeof fieldValues[locationFieldId] === 'string'
+                ? fieldValues[locationFieldId] as string
+                : ''}
+              onChangeText={(value) => {
+                updateLocalFieldValue(locationFieldId, value);
+                markFieldDirty(locationFieldId, (formatLocation(draft.location) ?? '') !== value.trim());
+                setDetailMessage(null);
+              }}
+              disabled={controlsDisabled}
+              placeholder="Enter a place, address, or highway marker"
+            />
+            <Text variant="bodySmall">
+              {draft.location ? `Saved location: ${formatLocation(draft.location) ?? 'Location details available'}` : 'No GPS location is available.'}
+            </Text>
+            {!readOnly ? (
+              <Button
+                mode="contained"
+                onPress={() => void saveIncidentDetailsEdits()}
+                disabled={!detailsDirty || controlsDisabled}
+                loading={savingFieldId === 'incident-details'}
+              >
+                Save and confirm details
+              </Button>
+            ) : null}
+            {detailMessage ? <HelperText type="info" visible>{detailMessage}</HelperText> : null}
+          </Card.Content>
+        </Card>
         {!readOnly ? (
           <Card>
             <Card.Content style={styles.cardContent}>
@@ -825,7 +1759,7 @@ export default function IncidentDraftRoute() {
                       The question planner used the server’s deterministic rule-order fallback.
                     </HelperText>
                   ) : null}
-                  {questionField && questionFieldForm ? (
+                  {questionField && questionMapping ? (
                     <>
                       <IncidentFieldEditor
                         field={questionField}
@@ -835,18 +1769,9 @@ export default function IncidentDraftRoute() {
                           setQuestionError(null);
                         }}
                         disabled={controlsDisabled || questionLoading || submittingTurn}
-                        readOnly={
-                          !questionFieldForm
-                          || questionFieldForm.activationStatus !== 'triggered'
-                          || questionField.configurationError !== null
-                        }
+                        readOnly={questionField.configurationError !== null}
                         promptOverride={nextQuestion.prompt}
                       />
-                      {questionFieldForm.activationStatus !== 'triggered' ? (
-                        <HelperText type="error" visible>
-                          The selected question belongs to a form that is not active in this draft; it cannot be answered.
-                        </HelperText>
-                      ) : null}
                       <Button
                         mode="contained"
                         onPress={() => void submitInterviewAnswer()}
@@ -855,12 +1780,32 @@ export default function IncidentDraftRoute() {
                           || questionLoading
                           || submittingTurn
                           || questionField.configurationError !== null
-                          || questionFieldForm.activationStatus !== 'triggered'
                         }
                         loading={submittingTurn}
                       >
                         Submit text answer
                       </Button>
+                      <Text variant="labelMedium">Or save a response status</Text>
+                      <View style={styles.choiceRow}>
+                        {nextQuestion.answerStates.map((answerState) => {
+                          const label = answerStateActions[answerState];
+                          return label ? (
+                            <Button
+                              key={answerState}
+                              mode="outlined"
+                              onPress={() => void saveInterviewAnswerState(answerState)}
+                              disabled={controlsDisabled || questionLoading || submittingTurn}
+                            >
+                              {label}
+                            </Button>
+                          ) : null;
+                        })}
+                      </View>
+                      {nextQuestion.required ? (
+                        <HelperText type="info" visible>
+                          A saved non-confirmed status advances the interview but remains a blocker for this required or safety-critical answer.
+                        </HelperText>
+                      ) : null}
                     </>
                   ) : (
                     <>
@@ -869,20 +1814,23 @@ export default function IncidentDraftRoute() {
                         <Text key={option.value} variant="bodyMedium">• {option.label}</Text>
                       ))}
                       <HelperText type="error" visible>
-                        This question key is not present in the pinned form definitions. It is read-only; no field key or answer mapping will be invented.
+                        This graph node has no unique pinned-field mapping. It cannot be answered or skipped until a definition maps it; no answer row will be written.
                       </HelperText>
-                      <Button
-                        mode="outlined"
-                        onPress={() => void skipUnmappedQuestion()}
-                        disabled={questionLoading || submittingTurn}
-                      >
-                        Skip and request next question
-                      </Button>
+                      {nextQuestion.required ? (
+                        <HelperText type="error" visible>
+                          This required or safety-critical question remains a submission blocker.
+                        </HelperText>
+                      ) : null}
                     </>
                   )}
                 </>
               ) : null}
               {turnMessage ? <HelperText type="info" visible>{turnMessage}</HelperText> : null}
+              {draft.answers.length ? (
+                <Button mode="outlined" onPress={returnToPreviousAnswer} disabled={questionLoading || submittingTurn}>
+                  Back to previous answer
+                </Button>
+              ) : null}
               <Button
                 mode="outlined"
                 onPress={() => void loadNextQuestion()}
@@ -890,6 +1838,273 @@ export default function IncidentDraftRoute() {
               >
                 Refresh question
               </Button>
+            </Card.Content>
+          </Card>
+        ) : null}
+        <Card onLayout={(event) => {
+          historyOffsetRef.current = event.nativeEvent.layout.y;
+        }}>
+          <Card.Content style={styles.cardContent}>
+            <Text variant="titleMedium">Interview history · edit a previous answer</Text>
+            <Text variant="bodySmall">
+              Select a saved response to correct it. The server re-evaluates form activation and the next eligible question after every saved correction.
+            </Text>
+            {!draft.answers.length ? (
+              <Text variant="bodyMedium">No interview answers have been saved yet.</Text>
+            ) : null}
+            {draft.answers.map((answer) => {
+              const identity = answerIdentity(answer);
+              const form = draft.forms.find((candidate) => candidate.formKey === answer.formKey);
+              const field = findAnswerField(draft, answer.formKey, answer.fieldKey, answer.groupInstanceId);
+              return (
+                <View key={identity} style={styles.historyRow}>
+                  <View style={styles.historyText}>
+                    <Text variant="labelLarge">
+                      {`${form ? formTitle(form) : answer.formKey} · ${field ? getFieldPrompt(field) : answer.fieldKey}`}
+                    </Text>
+                    <Text variant="bodySmall">
+                      {`${answerStateLabel(answer.answerState)} · ${field ? displayAnswer(field, answer.value) : 'Saved response'}`}
+                    </Text>
+                  </View>
+                  {!readOnly ? (
+                    <Button
+                      compact
+                      mode={historyAnswerId === identity ? 'contained' : 'outlined'}
+                      onPress={() => setHistoryAnswerId(historyAnswerId === identity ? null : identity)}
+                    >
+                      {historyAnswerId === identity ? 'Close' : 'Edit'}
+                    </Button>
+                  ) : null}
+                </View>
+              );
+            })}
+            {historyAnswer && historyForm && historyField && historyValueId ? (
+              <View style={styles.historyEditor}>
+                <Text variant="titleSmall">
+                  {`${formTitle(historyForm)} · ${getFieldPrompt(historyField)}`}
+                </Text>
+                <IncidentFieldEditor
+                  field={historyField}
+                  value={fieldValues[historyValueId] ?? initialFieldValue(historyField, historyAnswer.value)}
+                  onChange={(value) => changeAnswerValue(
+                    historyForm,
+                    historyField,
+                    value,
+                    historyAnswer.groupInstanceId,
+                  )}
+                  disabled={controlsDisabled || !historyForm.definition}
+                  readOnly={historyField.configurationError !== null}
+                />
+                {fieldErrors[historyValueId] ? (
+                  <HelperText type="error" visible>{fieldErrors[historyValueId]}</HelperText>
+                ) : null}
+                {historyForm.activationStatus === 'triggered' ? (
+                  <Button
+                    mode="contained"
+                    onPress={() => void saveField(
+                      historyForm,
+                      historyField,
+                      historyAnswer.groupInstanceId,
+                    )}
+                    disabled={controlsDisabled || !dirtyFields[historyValueId]}
+                    loading={savingFieldId === historyValueId}
+                  >
+                    Save correction
+                  </Button>
+                ) : (
+                  <HelperText type="info" visible>
+                    This form is no longer triggered by confirmed answers. Its previous response is retained for review; update the triggering answer first.
+                  </HelperText>
+                )}
+              </View>
+            ) : null}
+          </Card.Content>
+        </Card>
+        <Card>
+          <Card.Content style={styles.cardContent}>
+            <Text variant="titleMedium">Incident photos and evidence</Text>
+            <Text variant="bodySmall">
+              Capture clear photos of the scene, vehicle or property damage, or injury when applicable. Uploads are private to this report; server requirements determine whether a photo is required.
+            </Text>
+            {!readOnly ? (
+              <Button
+                mode="contained"
+                onPress={() => void captureIncidentPhoto()}
+                disabled={photoBusy || controlsDisabled}
+                loading={photoBusy}
+              >
+                Capture incident photo
+              </Button>
+            ) : null}
+            {photoBusy ? <ProgressBar indeterminate /> : null}
+            {photoError ? <HelperText type="error" visible>{photoError}</HelperText> : null}
+            {!draft.evidence.length ? (
+              <Text variant="bodyMedium">No incident evidence has been uploaded.</Text>
+            ) : null}
+            {draft.evidence.map((evidence) => {
+              const local = photoUploads[evidence.id];
+              const status = local?.status ?? evidence.uploadStatus;
+              return (
+                <View key={evidence.id} style={styles.evidenceRow}>
+                  <View style={styles.evidenceDetails}>
+                    <Text variant="labelLarge">
+                      {evidence.description?.trim() || 'Incident photo'}
+                    </Text>
+                    <Text variant="bodySmall">
+                      {`${evidence.mediaType} · ${Math.ceil(evidence.sizeBytes / 1024)} KB · ${status}`}
+                    </Text>
+                    {status === 'uploading' ? <ProgressBar indeterminate /> : null}
+                    {evidence.signedUrl ? (
+                      <Image
+                        source={{ uri: evidence.signedUrl }}
+                        accessibilityLabel="Uploaded incident evidence"
+                        resizeMode="cover"
+                        style={styles.evidenceImage}
+                      />
+                    ) : evidence.previewError ? (
+                      <HelperText type="error" visible>{evidence.previewError}</HelperText>
+                    ) : evidence.uploadStatus === 'uploaded' ? (
+                      <Text variant="bodySmall">Private preview unavailable. The uploaded evidence remains attached to this report.</Text>
+                    ) : null}
+                  </View>
+                  {!readOnly && status !== 'uploaded' ? (
+                    local ? (
+                      <Button
+                        compact
+                        mode="outlined"
+                        onPress={() => void retryPhotoUpload(evidence)}
+                        disabled={photoBusy || controlsDisabled}
+                      >
+                        Retry upload
+                      </Button>
+                    ) : (
+                      <Text variant="bodySmall">
+                        This device no longer has the original image. Capture a replacement.
+                      </Text>
+                    )
+                  ) : null}
+                </View>
+              );
+            })}
+          </Card.Content>
+        </Card>
+        {(interviewComplete || readOnly) ? (
+          <Card>
+            <Card.Content style={styles.cardContent}>
+              <Text variant="titleLarge">{readOnly ? 'Submitted report' : 'Review & submit'}</Text>
+              <Text variant="bodySmall">
+                Review every pinned form, answer status, and evidence item below. Check server readiness for this saved revision before device confirmation; submission validates again and will not submit if anything changed or remains incomplete.
+              </Text>
+              <Text variant="labelLarge">Applicable forms</Text>
+              {draft.forms.filter((form) => form.activationStatus === 'triggered').length ? (
+                draft.forms
+                  .filter((form) => form.activationStatus === 'triggered')
+                  .map((form) => (
+                    <Chip key={`review:${form.formKey}`} compact>
+                      {`${formTitle(form)} · pinned v${form.version}`}
+                    </Chip>
+                  ))
+              ) : (
+                <HelperText type="error" visible>
+                  No form is currently triggered by confirmed answers. The server will reject incomplete submissions.
+                </HelperText>
+              )}
+              <Text variant="labelLarge">Evidence review</Text>
+              <Text variant="bodyMedium">
+                {`${draft.evidence.filter((item) => item.uploadStatus === 'uploaded').length} uploaded · ${draft.evidence.filter((item) => item.uploadStatus !== 'uploaded').length} pending or failed`}
+              </Text>
+              {submitIssues.length ? (
+                <View style={styles.field}>
+                  <Text variant="labelLarge">Server-reported missing requirements</Text>
+                  {submitIssues.map((issue, index) => (
+                    <View
+                      key={`${issue.formKey}:${issue.fieldKey}:${issue.groupInstanceId}:${index}`}
+                      style={styles.issue}
+                    >
+                      <Text variant="labelLarge">{issueLabel(issue, draft)}</Text>
+                      <HelperText type="error" visible>
+                        {issue.message ?? 'Complete this server-required item before submitting.'}
+                      </HelperText>
+                      {issue.expectedMediaType ? (
+                        <Text variant="bodySmall">
+                          {`${issue.uploadedCount ?? 0} of ${issue.requiredCount ?? 1} ${issue.expectedMediaType} evidence items uploaded`}
+                        </Text>
+                      ) : null}
+                      {issue.expectedType ? (
+                        <Text variant="bodySmall">{`Expected response: ${issue.expectedType}`}</Text>
+                      ) : null}
+                      {issue.answerState ? (
+                        <Text variant="bodySmall">{`Current answer status: ${issue.answerState}`}</Text>
+                      ) : null}
+                      {issue.provenance?.source ? (
+                        <Text variant="bodySmall">{`Answer source: ${issue.provenance.source}`}</Text>
+                      ) : null}
+                      {issue.provenance?.confidence !== null
+                        && issue.provenance?.confidence !== undefined ? (
+                          <Text variant="bodySmall">{`Recorded confidence: ${Math.round(issue.provenance.confidence * 100)}%`}</Text>
+                        ) : null}
+                      {issueActionLabel(issue.action) ? (
+                        <Chip compact>{issueActionLabel(issue.action)}</Chip>
+                      ) : null}
+                    </View>
+                  ))}
+                </View>
+              ) : null}
+              {submitError ? <HelperText type="error" visible>{submitError}</HelperText> : null}
+              {readinessMessage ? <HelperText type="info" visible>{readinessMessage}</HelperText> : null}
+              {readinessVersion !== null && readinessVersion !== draft.version ? (
+                <HelperText type="info" visible>
+                  This readiness result is for an older revision. Check again after saving the latest changes.
+                </HelperText>
+              ) : null}
+              {!readOnly ? (
+                <>
+                  {pendingSubmission ? (
+                    <HelperText type="info" visible>
+                      A prior submission may have reached the server. Retrying reuses the saved confirmation reference to avoid a duplicate report.
+                    </HelperText>
+                  ) : null}
+                  {!pendingSubmission ? (
+                    <Button
+                      mode="outlined"
+                      onPress={() => void checkSubmissionReadiness()}
+                      disabled={
+                        readinessLoading
+                        || submitting
+                        || needsRefresh
+                        || Object.values(dirtyFieldsRef.current).some(Boolean)
+                        || cacheConflict !== null
+                        || editCacheConflict.kind === 'conflict'
+                      }
+                      loading={readinessLoading}
+                    >
+                      Check server readiness
+                    </Button>
+                  ) : null}
+                  <Button
+                    mode="contained"
+                    onPress={() => void submitReport()}
+                    disabled={
+                      submitting
+                      || !interviewComplete
+                      || needsRefresh
+                      || readinessLoading
+                      || Object.values(dirtyFieldsRef.current).some(Boolean)
+                      || cacheConflict !== null
+                      || editCacheConflict.kind === 'conflict'
+                      || (
+                        !pendingSubmission
+                        && (readinessVersion !== draft.version || submitIssues.length > 0)
+                      )
+                    }
+                    loading={submitting}
+                  >
+                    {pendingSubmission ? 'Retry submission' : 'Confirm on this device & submit'}
+                  </Button>
+                </>
+              ) : (
+                <Text variant="titleMedium">Submitted · awaiting review</Text>
+              )}
             </Card.Content>
           </Card>
         ) : null}
@@ -926,7 +2141,7 @@ export default function IncidentDraftRoute() {
             <Card.Content style={styles.cardContent}>
               <Text variant="titleSmall">Server state needs a refresh</Text>
               <Text variant="bodyMedium">
-                If an answer was rejected as stale, it was not saved. Reload the server form before trying again; unsaved non-narrative answers will be discarded, while the narrative cache is preserved.
+                If an answer was rejected as stale, the server did not save it. Reload to compare the current server values with preserved device edits before deciding which copy to keep.
               </Text>
               <Button mode="contained" onPress={() => void reloadServerForm()}>
                 Reload server form
@@ -946,6 +2161,7 @@ export default function IncidentDraftRoute() {
         {draft.forms.map((form) => {
           const isActive = form.activationStatus === 'triggered';
           const fields = form.definition?.fields ?? [];
+          const scalarFields = fields.filter((field) => field.groupKey === null);
           let previousSection: string | null = null;
           return (
             <Card key={`${form.formKey}:${form.version}`}>
@@ -965,8 +2181,13 @@ export default function IncidentDraftRoute() {
                     {warning}
                   </HelperText>
                 ))}
-                {fields.map((field) => {
-                  const fieldId = formFieldId(form.formKey, field.key);
+                {scalarFields.map((field) => {
+                  const fieldId = answerValueId(form.formKey, field.key, null);
+                  const savedAnswer = draft.answers.find(
+                    (answer) => answer.formKey === form.formKey
+                      && answer.fieldKey === field.key
+                      && answer.groupInstanceId === null,
+                  );
                   const showSection = field.section !== null && field.section !== previousSection;
                   previousSection = field.section;
                   const value = fieldValues[fieldId] ?? initialFieldValue(field, null);
@@ -976,17 +2197,32 @@ export default function IncidentDraftRoute() {
                       <IncidentFieldEditor
                         field={field}
                         value={value}
-                        onChange={(next) => changeFieldValue(form, field, next)}
+                        onChange={(next) => changeAnswerValue(form, field, next, null)}
                         disabled={controlsDisabled || !isActive}
                         readOnly={readOnly || !isActive}
                       />
+                      {savedAnswer ? (
+                        <Text variant="bodySmall">{`Source: ${savedAnswer.source}`}</Text>
+                      ) : null}
+                      {savedAnswer && savedAnswer.answerState !== 'confirmed' ? (
+                        <>
+                          <Chip compact>
+                            {`Saved status: ${answerStateLabel(savedAnswer.answerState)}`}
+                          </Chip>
+                          {field.required || field.key === 'injuries' ? (
+                            <HelperText type="error" visible>
+                              This required or safety-critical answer is not confirmed and will block submission.
+                            </HelperText>
+                          ) : null}
+                        </>
+                      ) : null}
                       {fieldErrors[fieldId] ? (
                         <HelperText type="error" visible>{fieldErrors[fieldId]}</HelperText>
                       ) : null}
                       {!readOnly && isActive && !field.configurationError ? (
                         <Button
                           mode="contained"
-                          onPress={() => void saveField(form, field)}
+                          onPress={() => void saveField(form, field, null)}
                           disabled={
                             controlsDisabled
                             || !dirtyFields[fieldId]
@@ -997,6 +2233,108 @@ export default function IncidentDraftRoute() {
                           Save answer
                         </Button>
                       ) : null}
+                    </View>
+                  );
+                })}
+                {form.definition?.groups.map((group) => {
+                  const instances = draft.groups
+                    .filter((entry) => entry.formKey === form.formKey && entry.groupKey === group.key)
+                    .sort((left, right) => left.position - right.position);
+                  const groupFields = fields.filter((field) => field.groupKey === group.key);
+                  return (
+                    <View key={`${form.formKey}:group:${group.key}`} style={styles.groupSection}>
+                      <View style={styles.formHeader}>
+                        <Text variant="titleSmall">
+                          {`${group.label}${group.required ? ' · Required group' : ''}`}
+                        </Text>
+                        {!readOnly && isActive ? (
+                          <Button
+                            compact
+                            mode="outlined"
+                            onPress={() => void addRepeatedGroup(form, group.key)}
+                            disabled={controlsDisabled || creatingGroup === `${form.formKey}:${group.key}`}
+                            loading={creatingGroup === `${form.formKey}:${group.key}`}
+                          >
+                            Add
+                          </Button>
+                        ) : null}
+                      </View>
+                      {!instances.length ? (
+                        <HelperText type={group.required ? 'error' : 'info'} visible>
+                          {group.required ? 'At least one repeated item is required.' : 'No repeated items added.'}
+                        </HelperText>
+                      ) : null}
+                      {instances.map((instance, index) => {
+                        const hasUnsavedValues = Object.entries(dirtyFields).some(([fieldId, dirty]) => {
+                          const identity = parseAnswerFieldId(fieldId);
+                          return dirty && identity?.[2] === instance.id;
+                        });
+                        return (
+                          <View key={instance.id} style={styles.groupInstance}>
+                            <View style={styles.formHeader}>
+                              <Text variant="labelLarge">{`${group.label} ${index + 1}`}</Text>
+                              {!readOnly ? (
+                                <Button
+                                  compact
+                                  mode="outlined"
+                                  onPress={() => confirmRemoveRepeatedGroup(instance, group.label)}
+                                  disabled={
+                                    controlsDisabled
+                                    || !isActive
+                                    || deletingGroup === instance.id
+                                    || (group.required && instances.length === 1)
+                                    || hasUnsavedValues
+                                  }
+                                  loading={deletingGroup === instance.id}
+                                >
+                                  Remove
+                                </Button>
+                              ) : null}
+                            </View>
+                            {hasUnsavedValues ? (
+                              <HelperText type="info" visible>
+                                Save or discard unsaved fields before removing this item.
+                              </HelperText>
+                            ) : null}
+                            {groupFields.map((field) => {
+                              const fieldId = answerValueId(form.formKey, field.key, instance.id);
+                              const savedAnswer = draft.answers.find(
+                                (answer) => answer.formKey === form.formKey
+                                  && answer.fieldKey === field.key
+                                  && answer.groupInstanceId === instance.id,
+                              );
+                              const value = fieldValues[fieldId] ?? initialFieldValue(field, savedAnswer?.value ?? null);
+                              return (
+                                <View key={fieldId} style={styles.field}>
+                                  <IncidentFieldEditor
+                                    field={field}
+                                    value={value}
+                                    onChange={(next) => changeAnswerValue(form, field, next, instance.id)}
+                                    disabled={controlsDisabled || !isActive}
+                                    readOnly={readOnly || !isActive}
+                                  />
+                                  {savedAnswer ? (
+                                    <Text variant="bodySmall">{`Source: ${savedAnswer.source} · ${answerStateLabel(savedAnswer.answerState)}`}</Text>
+                                  ) : null}
+                                  {fieldErrors[fieldId] ? (
+                                    <HelperText type="error" visible>{fieldErrors[fieldId]}</HelperText>
+                                  ) : null}
+                                  {!readOnly && isActive && !field.configurationError ? (
+                                    <Button
+                                      mode="contained"
+                                      onPress={() => void saveField(form, field, instance.id)}
+                                      disabled={controlsDisabled || !dirtyFields[fieldId]}
+                                      loading={savingFieldId === fieldId}
+                                    >
+                                      Save item
+                                    </Button>
+                                  ) : null}
+                                </View>
+                              );
+                            })}
+                          </View>
+                        );
+                      })}
                     </View>
                   );
                 })}
@@ -1045,6 +2383,55 @@ const styles = StyleSheet.create({
     flexShrink: 1,
     gap: 4,
   },
+  historyRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 8,
+    justifyContent: 'space-between',
+  },
+  historyText: {
+    flex: 1,
+    gap: 4,
+  },
+  historyEditor: {
+    borderTopColor: '#D5D9E1',
+    borderTopWidth: StyleSheet.hairlineWidth,
+    gap: 12,
+    paddingTop: 12,
+  },
+  evidenceRow: {
+    borderTopColor: '#D5D9E1',
+    borderTopWidth: StyleSheet.hairlineWidth,
+    gap: 8,
+    paddingTop: 12,
+  },
+  evidenceDetails: {
+    gap: 8,
+  },
+  issue: {
+    borderTopColor: '#D5D9E1',
+    borderTopWidth: StyleSheet.hairlineWidth,
+    gap: 4,
+    paddingTop: 8,
+  },
+  evidenceImage: {
+    alignSelf: 'flex-start',
+    borderRadius: 8,
+    height: 180,
+    width: 240,
+  },
+  groupSection: {
+    borderTopColor: '#D5D9E1',
+    borderTopWidth: StyleSheet.hairlineWidth,
+    gap: 12,
+    paddingTop: 12,
+  },
+  groupInstance: {
+    backgroundColor: '#F3F4F7',
+    borderRadius: 8,
+    gap: 12,
+    padding: 12,
+  },
   field: {
     gap: 8,
   },
@@ -1053,6 +2440,7 @@ const styles = StyleSheet.create({
   },
   choiceRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: 12,
   },
   optionButton: {

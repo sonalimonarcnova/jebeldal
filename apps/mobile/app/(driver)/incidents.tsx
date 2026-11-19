@@ -31,10 +31,10 @@ function formLabel(formKey: string): string {
 
 function IncidentCardView({
   incident,
-  onResume,
+  onOpen,
 }: {
   incident: IncidentCard;
-  onResume: (revisionId: string) => void;
+  onOpen: (revisionId: string) => void;
 }) {
   const activeRevisionId = incident.activeRevisionId;
   const content = (
@@ -63,8 +63,11 @@ function IncidentCardView({
     </Card.Content>
   );
 
-  return incident.status === 'draft' && activeRevisionId ? (
-    <Card onPress={() => onResume(activeRevisionId)} accessibilityLabel="Resume draft">
+  return activeRevisionId ? (
+    <Card
+      onPress={() => onOpen(activeRevisionId)}
+      accessibilityLabel={incident.status === 'draft' ? 'Resume draft' : 'View submitted report'}
+    >
       {content}
     </Card>
   ) : (
@@ -186,7 +189,7 @@ export default function IncidentsRoute() {
               <IncidentCardView
                 key={incident.id}
                 incident={incident}
-                onResume={(revisionId) =>
+                onOpen={(revisionId) =>
                   router.push({ pathname: '/incident/[revisionId]', params: { revisionId } })
                 }
               />

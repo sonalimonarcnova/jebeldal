@@ -1,28 +1,29 @@
 import { z } from 'zod';
 
+import { postgresUuidSchema } from '../lib/postgresUuid';
 import { supabase } from '../lib/supabase';
 
 const profileRowSchema = z.object({
-  user_id: z.string().uuid(),
-  organization_id: z.string().uuid(),
+  user_id: postgresUuidSchema,
+  organization_id: postgresUuidSchema,
   role: z.string(),
   display_name: z.string(),
   phone: z.string().nullable(),
   employee_id: z.string().nullable(),
-  assigned_vehicle_id: z.string().uuid().nullable(),
+  assigned_vehicle_id: postgresUuidSchema.nullable(),
   preferred_language: z.string(),
   profile_completed_at: z.string().nullable(),
 });
 
 const vehicleSchema = z.object({
-  id: z.string().uuid(),
+  id: postgresUuidSchema,
   unit_number: z.string(),
   plate: z.string().nullable(),
   make_model: z.string().nullable(),
 });
 
 const organizationSchema = z.object({
-  id: z.string().uuid(),
+  id: postgresUuidSchema,
   display_name: z.string(),
 });
 
@@ -66,7 +67,14 @@ export async function loadDriverProfile(userId: string): Promise<DriverProfile |
 
   const profileResult = profileRowSchema.safeParse(data);
   if (!profileResult.success) {
-    throw new Error('The driver profile returned by Supabase is invalid.');
+    const invalidFields = [
+      ...new Set(
+        profileResult.error.issues.map((issue) => issue.path.join('.') || 'row'),
+      ),
+    ];
+    throw new Error(
+      `The driver profile returned by Supabase is invalid (${invalidFields.join(', ')}).`,
+    );
   }
   const profile = profileResult.data;
 

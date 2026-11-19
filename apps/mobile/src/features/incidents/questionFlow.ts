@@ -1,4 +1,8 @@
 import type { FormFieldDefinition, FormOptionDefinition } from './formDefinition';
+import {
+  persistedAnswerStates,
+  type PersistedAnswerState,
+} from './rpcOperations';
 
 export type InterviewQuestion = {
   formKey: string | null;
@@ -6,6 +10,8 @@ export type InterviewQuestion = {
   prompt: string;
   options: FormOptionDefinition[];
   selectionSource: string | null;
+  required: boolean;
+  answerStates: PersistedAnswerState[];
 };
 
 export type NextQuestionResult =
@@ -79,9 +85,29 @@ export function parseNextQuestionResponse(value: unknown): NextQuestionResult {
   const formKey = nonEmptyString(candidate.form_key);
   const fieldKey = nonEmptyString(candidate.field_key) ?? nonEmptyString(candidate.key);
   const prompt = nonEmptyString(candidate.prompt) ?? nonEmptyString(candidate.question_prompt);
-  if (!fieldKey || !prompt) {
-    throw new Error('The selected question is missing its key or authored prompt.');
+  if (
+    !fieldKey ||
+    !prompt ||
+    !Object.hasOwn(candidate, 'form_key') ||
+    typeof candidate.required !== 'boolean'
+  ) {
+    throw new Error('The selected question is missing its pinned form, key, or authored prompt.');
   }
+  if (candidate.form_key !== null && !formKey) {
+    throw new Error('The selected question contains an invalid pinned form key.');
+  }
+  if (!Array.isArray(candidate.answer_states)) {
+    throw new Error('The selected question contains invalid answer-state options.');
+  }
+  const answerStates = candidate.answer_states.map((state) => {
+    if (
+      typeof state !== 'string' ||
+      !persistedAnswerStates.includes(state as PersistedAnswerState)
+    ) {
+      throw new Error('The selected question contains an unsupported answer state.');
+    }
+    return state as PersistedAnswerState;
+  });
 
   const selectionSource = nonEmptyString(value.selection_source)
     ?? nonEmptyString(candidate.selection_source);
@@ -93,6 +119,8 @@ export function parseNextQuestionResponse(value: unknown): NextQuestionResult {
       prompt,
       options: parseOptions(candidate.options),
       selectionSource,
+      required: candidate.required === true,
+      answerStates,
     },
   };
 }
@@ -162,11 +190,12 @@ export function findPinnedQuestionMapping(
     definition: { fields: FormFieldDefinition[] } | null;
   }[],
 ): { formKey: string; field: FormFieldDefinition } | null {
-  const candidates = question.formKey
-    ? forms.filter((form) => form.formKey === question.formKey)
-    : forms;
+  if (!question.formKey) return null;
+  const candidates = forms.filter((form) => form.formKey === question.formKey);
   const matches = candidates.flatMap((form) => {
-    const field = form.definition?.fields.find((candidate) => candidate.key === question.fieldKey);
+    const field = form.definition?.fields.find(
+      (candidate) => candidate.key === question.fieldKey && candidate.groupKey === null,
+    );
     return field ? [{ formKey: form.formKey, field }] : [];
   });
   return matches.length === 1 ? matches[0] : null;

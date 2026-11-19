@@ -23,6 +23,7 @@ export type FormFieldDefinition = {
   type: string;
   required: boolean;
   section: string | null;
+  groupKey: string | null;
   label?: unknown;
   question?: unknown;
   options: FormOptionDefinition[];
@@ -30,9 +31,17 @@ export type FormFieldDefinition = {
   configurationError: string | null;
 };
 
+export type FormGroupDefinition = {
+  key: string;
+  label: string;
+  required: boolean;
+  section: string | null;
+};
+
 export type ParsedFormDefinition = {
   title: string | null;
   fields: FormFieldDefinition[];
+  groups: FormGroupDefinition[];
   warnings: string[];
 };
 
@@ -120,7 +129,11 @@ function sectionName(value: unknown): string | null {
     ?? (typeof value.key === 'string' ? humanizeKey(value.key) : null);
 }
 
-function makeField(node: Record<string, unknown>, inheritedSection: string | null): FormFieldDefinition | null {
+function makeField(
+  node: Record<string, unknown>,
+  inheritedSection: string | null,
+  groupKey: string | null,
+): FormFieldDefinition | null {
   if (typeof node.key !== 'string' || !node.key.trim() || typeof node.type !== 'string') {
     return null;
   }
@@ -144,6 +157,7 @@ function makeField(node: Record<string, unknown>, inheritedSection: string | nul
     type,
     required: node.required === true,
     section: sectionName(node.section) ?? inheritedSection,
+    groupKey,
     label: node.label,
     question: node.question,
     options,
@@ -155,7 +169,9 @@ function makeField(node: Record<string, unknown>, inheritedSection: string | nul
 function collectFields(
   nodes: unknown,
   inheritedSection: string | null,
+  inheritedGroupKey: string | null,
   fields: FormFieldDefinition[],
+  groups: FormGroupDefinition[],
   warnings: string[],
 ): void {
   if (!Array.isArray(nodes)) {
@@ -168,11 +184,31 @@ function collectFields(
       continue;
     }
 
+    if (node.type === 'repeated_group') {
+      if (typeof node.key !== 'string' || !node.key.trim()) {
+        warnings.push('A repeated group is missing a usable key and cannot be edited.');
+        continue;
+      }
+      if (inheritedGroupKey) {
+        warnings.push('Nested repeated groups are not supported by this mobile form renderer.');
+        continue;
+      }
+      const key = node.key.trim();
+      groups.push({
+        key,
+        label: localizedText(node.label) ?? humanizeKey(key),
+        required: node.required === true,
+        section: sectionName(node.section) ?? inheritedSection,
+      });
+      collectFields(node.fields, sectionName(node) ?? inheritedSection, key, fields, groups, warnings);
+      continue;
+    }
+
     if (
       typeof node.type === 'string'
       || (typeof node.key === 'string' && !Array.isArray(node.fields) && !Array.isArray(node.sections))
     ) {
-      const field = makeField(node, inheritedSection);
+      const field = makeField(node, inheritedSection, inheritedGroupKey);
       if (field) {
         fields.push(field);
       } else {
@@ -183,7 +219,7 @@ function collectFields(
 
     const section = sectionName(node) ?? inheritedSection;
     if (Array.isArray(node.fields)) {
-      collectFields(node.fields, section, fields, warnings);
+      collectFields(node.fields, section, inheritedGroupKey, fields, groups, warnings);
     } else {
       warnings.push('A pinned definition entry has no fields and cannot be rendered.');
     }
@@ -195,12 +231,14 @@ export function parseFormDefinition(definition: unknown): ParsedFormDefinition {
     return {
       title: null,
       fields: [],
+      groups: [],
       warnings: ['The pinned form definition is not a valid object.'],
     };
   }
 
   const title = localizedText(definition.label) ?? localizedText(definition.title);
   const parsedFields: FormFieldDefinition[] = [];
+  const parsedGroups: FormGroupDefinition[] = [];
   const warnings: string[] = [];
   const hasSections = Array.isArray(definition.sections);
   const hasFields = Array.isArray(definition.fields);
@@ -208,37 +246,50 @@ export function parseFormDefinition(definition: unknown): ParsedFormDefinition {
     return {
       title,
       fields: [],
+      groups: [],
       warnings: ['The pinned form definition contains no renderable fields.'],
     };
   }
 
   if (hasSections) {
-    collectFields(definition.sections, null, parsedFields, warnings);
+    collectFields(definition.sections, null, null, parsedFields, parsedGroups, warnings);
   }
   if (hasFields) {
-    collectFields(definition.fields, null, parsedFields, warnings);
+    collectFields(definition.fields, null, null, parsedFields, parsedGroups, warnings);
   }
 
   const fields: FormFieldDefinition[] = [];
   const seenKeys = new Set<string>();
   for (const field of parsedFields) {
-    if (seenKeys.has(field.key)) {
+    const identity = JSON.stringify([field.groupKey, field.key]);
+    if (seenKeys.has(identity)) {
       warnings.push(`The pinned definition repeats field key “${field.key}”; it is shown once.`);
       continue;
     }
-    seenKeys.add(field.key);
+    seenKeys.add(identity);
     fields.push(field);
+  }
+  const groups: FormGroupDefinition[] = [];
+  const seenGroups = new Set<string>();
+  for (const group of parsedGroups) {
+    if (seenGroups.has(group.key)) {
+      warnings.push(`The pinned definition repeats group key “${group.key}”; it is shown once.`);
+      continue;
+    }
+    seenGroups.add(group.key);
+    groups.push(group);
   }
   if (!fields.length && !warnings.length) {
     warnings.push('The pinned form definition contains no renderable fields.');
   }
-  return { title, fields, warnings };
+  return { title, fields, groups, warnings };
 }
 
 function findInNodes(
   nodes: unknown,
   fieldKey: string,
   inheritedSection: string | null = null,
+  groupKey: string | null = null,
 ): FormFieldDefinition | null {
   if (!Array.isArray(nodes)) {
     return null;
@@ -248,7 +299,12 @@ function findInNodes(
     if (!isRecord(node)) {
       continue;
     }
-    const candidate = makeField(node, inheritedSection);
+    if (node.type === 'repeated_group' && typeof node.key === 'string') {
+      const nested = findInNodes(node.fields, fieldKey, sectionName(node) ?? inheritedSection, node.key);
+      if (nested) return nested;
+      continue;
+    }
+    const candidate = makeField(node, inheritedSection, groupKey);
     if (candidate?.key === fieldKey) {
       return candidate;
     }
@@ -257,6 +313,7 @@ function findInNodes(
         node.fields,
         fieldKey,
         sectionName(node) ?? inheritedSection,
+        groupKey,
       );
       if (nested) {
         return nested;
@@ -286,6 +343,13 @@ export function formFieldId(formKey: string, fieldKey: string): string {
   return JSON.stringify([formKey, fieldKey]);
 }
 
+export function groupedFormFieldId(
+  formKey: string,
+  fieldKey: string,
+  groupInstanceId: string,
+): string {
+  return JSON.stringify([formKey, fieldKey, groupInstanceId]);
+}
 export function initialFieldValue(field: FormFieldDefinition, value: unknown): unknown {
   if (value !== null && value !== undefined) {
     return value;
