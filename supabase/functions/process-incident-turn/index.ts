@@ -21,6 +21,8 @@ type TurnResponse = {
   suggested: Proposal[];
   latency_ms: { stt: number; llm: number };
   mode: ProviderMode;
+  /** keys extracted from this turn but not written because the driver already set them (tap/typed/edited) */
+  kept_existing: string[];
 };
 
 /** Shape stored in conversation_turns.extraction_proposals. */
@@ -342,6 +344,7 @@ async function handle(req: Request): Promise<Response> {
       suggested: result.suggested,
       latency_ms: latency,
       mode: providers.mode,
+      kept_existing: keptExisting,
     };
     const stored: StoredExtraction = {
       version: 1,
