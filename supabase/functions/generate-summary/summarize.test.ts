@@ -1,6 +1,8 @@
 import { deepStrictEqual, ok, strictEqual, throws } from 'node:assert/strict';
 import {
+  buildSummaryInstructions,
   buildSummaryForm,
+  buildPromptForms,
   mapSummaryError,
   summarize,
   validateDescriptions,
@@ -96,6 +98,48 @@ Deno.test('a triggered form can use confirmed answers captured under another act
     label: 'What else was involved?',
     value: 'A building, fence, or object',
   }]);
+});
+
+Deno.test('prompt input keeps the story and removes structured facts already in it', () => {
+  const story = 'A silver sedan cut in front of me. Police came. Nobody was hurt. The front bumper is bent.';
+  const promptForms = buildPromptForms([{
+    form_key: 'auto',
+    label: 'Auto',
+    answers: [
+      { field_key: 'what_happened', label: 'Description of accident', value: story, is_story: true },
+      { field_key: 'other_vehicle', label: 'Other vehicle', value: 'Silver sedan' },
+      { field_key: 'police', label: 'Police contacted?', value: 'Yes, they came' },
+      { field_key: 'injuries', label: 'Driver injured?', value: 'No one' },
+      { field_key: 'truck_damage', label: 'Truck damage', value: 'Front bumper' },
+      { field_key: 'drivable', label: 'Drivable', value: 'Needs a tow' },
+    ],
+  }]);
+  strictEqual(promptForms[0].story_answer, story);
+  deepStrictEqual(
+    promptForms[0].additional_confirmed_answers.map((answer) => answer.field_key),
+    ['drivable'],
+  );
+});
+
+Deno.test('prompt gives each of two triggered forms its own specific focus', () => {
+  const generalLiability: SummaryForm = {
+    form_key: 'general_liability',
+    label: 'General Liability Occurrence',
+    answers: [{ field_key: 'property_description', label: 'Description of property', value: 'A fence' }],
+  };
+  const instructions = buildSummaryInstructions([form, generalLiability]);
+  ok(instructions.includes('auto (Automobile / Fleet Loss): Focus only on the vehicles involved'));
+  ok(instructions.includes('general_liability (General Liability Occurrence): Focus only on third-party property damage'));
+  ok(!instructions.includes('workers_comp:'));
+  ok(instructions.includes('Use story_answer as the narrative backbone'));
+  ok(instructions.includes('Never start a sentence with "I reported that"'));
+  ok(instructions.includes('Treat every fact stated or paraphrased in the story as already covered'));
+  ok(instructions.includes('Low speed or visible damage does not establish drivability.'));
+  ok(instructions.includes('An object being involved or clipped does not establish that it was damaged.'));
+  ok(instructions.includes('Do not mention drivability unless a confirmed answer explicitly states it'));
+  ok(instructions.includes('do not add another sentence about that damage or police response'));
+  ok(instructions.includes('Do not say the truck remains drivable unless a confirmed answer explicitly says it can be driven.'));
+  ok(instructions.includes('do not say the property was damaged unless a confirmed answer says so.'));
 });
 
 Deno.test('mock summaries are deterministic and built from confirmed answers', async () => {
