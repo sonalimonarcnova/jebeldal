@@ -10,6 +10,15 @@ import {
   parseFormDefinition,
   validateFieldValue,
 } from '../src/features/incidents/formDefinition.ts';
+import {
+  createClientTurnId,
+  findPinnedQuestionField,
+  parseNextQuestionResponse,
+  parseProcessedTurnResponse,
+  processIncidentTextTurnWith,
+  questionAnswerText,
+  selectNextQuestionWith,
+} from '../src/features/incidents/questionFlow.ts';
 import { createAuthRequestTimeoutFetch } from '../src/lib/authRequestTimeoutFetch.ts';
 import {
   formatLocation,
@@ -347,6 +356,174 @@ test('pinned form field lookup traverses nested fields and uses authored prompt 
   assert.equal(field.type, 'long_text');
   assert.equal(getFieldPrompt(field), 'Describe the fictional incident.');
   assert.equal(findFieldDefinition(definition, 'unknown_field'), null);
+});
+
+test('question-flow response parsing handles authored questions, options, and completion', () => {
+  assert.deepEqual(
+    parseNextQuestionResponse({
+      selection_source: 'deterministic_fallback',
+      interview_complete: false,
+      selected_question: {
+        key: 'injuries',
+        prompt: 'Was anyone hurt?',
+        ui_type: 'single_select',
+        options: [
+          'No one',
+          { value: 'driver', label: { en: 'The driver' } },
+        ],
+      },
+    }),
+    {
+      kind: 'question',
+      question: {
+        formKey: null,
+        fieldKey: 'injuries',
+        prompt: 'Was anyone hurt?',
+        options: [
+          { value: 'No one', label: 'No one' },
+          { value: 'driver', label: 'The driver' },
+        ],
+        selectionSource: 'deterministic_fallback',
+      },
+    },
+  );
+  assert.deepEqual(
+    parseNextQuestionResponse({ status: 'interview_complete' }),
+    { kind: 'complete' },
+  );
+  assert.deepEqual(
+    parseNextQuestionResponse({ interview_complete: true }),
+    { kind: 'complete' },
+  );
+  assert.throws(
+    () => parseNextQuestionResponse({ next_question: { field_key: 'unknown' } }),
+    /missing its key or authored prompt/,
+  );
+  assert.throws(
+    () => parseNextQuestionResponse({ question: { options: 'invented' } }),
+    /missing its key or authored prompt/,
+  );
+});
+
+test('question-flow invocation uses the documented edge-function request bodies', async () => {
+  const calls = [];
+  const invoke = async (functionName, body) => {
+    calls.push({ functionName, body });
+    if (functionName === 'select-next-question') {
+      return {
+        data: {
+          selected_question: {
+            key: 'what_happened',
+            prompt: 'What happened?',
+          },
+          interview_complete: false,
+        },
+        error: null,
+      };
+    }
+    return {
+      data: { turn_id: 'turn-1', status: 'completed' },
+      error: null,
+    };
+  };
+
+  const selected = await selectNextQuestionWith(invoke, revisionId);
+  const processed = await processIncidentTextTurnWith(invoke, {
+    revisionId,
+    clientTurnId: 'mobile-stable-retry-id',
+    text: '  A fictional event occurred.  ',
+  });
+
+  assert.deepEqual(calls, [
+    {
+      functionName: 'select-next-question',
+      body: { incident_revision_id: revisionId },
+    },
+    {
+      functionName: 'process-incident-turn',
+      body: {
+        incident_revision_id: revisionId,
+        client_turn_id: 'mobile-stable-retry-id',
+        text: 'A fictional event occurred.',
+      },
+    },
+  ]);
+  assert.equal(selected.kind, 'question');
+  assert.deepEqual(processed, { turnId: 'turn-1', status: 'completed' });
+});
+
+test('turn contract parsing rejects unaccepted and malformed responses instead of implying success', async () => {
+  assert.deepEqual(
+    parseProcessedTurnResponse({ turn_id: 'turn-2', status: 'processing' }),
+    { turnId: 'turn-2', status: 'processing' },
+  );
+  assert.throws(
+    () => parseProcessedTurnResponse({ turn_id: 'turn-3', status: 'failed' }),
+    /did not confirm an accepted turn/,
+  );
+  await assert.rejects(
+    processIncidentTextTurnWith(async () => ({
+      data: null,
+      error: { message: 'Edge Function returned 501 NOT_IMPLEMENTED' },
+    }), {
+      revisionId,
+      clientTurnId: 'turn-retry',
+      text: 'Fictional answer',
+    }),
+    /501 NOT_IMPLEMENTED/,
+  );
+  await assert.rejects(
+    processIncidentTextTurnWith(async () => ({ data: null, error: null }), {
+      revisionId,
+      clientTurnId: 'turn-empty',
+      text: '   ',
+    }),
+    /Enter an answer/,
+  );
+});
+
+test('question answers map only to pinned fields and preserve authored option values', () => {
+  const form = {
+    formKey: 'auto',
+    definition: parseFormDefinition({
+      fields: [
+        {
+          key: 'injuries',
+          type: 'enum',
+          options: [
+            { value: 'none', label: { en: 'No one' } },
+            { value: 'driver', label: { en: 'The driver' } },
+          ],
+        },
+      ],
+    }),
+  };
+  const knownQuestion = {
+    formKey: 'auto',
+    fieldKey: 'injuries',
+    prompt: 'Was anyone hurt?',
+    options: [],
+    selectionSource: null,
+  };
+  const field = findPinnedQuestionField(knownQuestion, [form]);
+
+  assert.equal(field?.key, 'injuries');
+  assert.equal(questionAnswerText(field, 'driver'), 'The driver');
+  assert.equal(findPinnedQuestionField({
+    ...knownQuestion,
+    fieldKey: 'not_in_the_pinned_definition',
+  }, [form]), null);
+  assert.equal(findPinnedQuestionField({ ...knownQuestion, formKey: null }, [
+    form,
+    { formKey: 'workers_comp', definition: form.definition },
+  ]), null);
+});
+
+test('client turn IDs are non-empty and distinct for independent submissions', () => {
+  const first = createClientTurnId();
+  const second = createClientTurnId();
+  assert.match(first, /^mobile-/);
+  assert.notEqual(first, second);
 });
 
 test('draft cache keys are isolated by user, revision, and field', () => {

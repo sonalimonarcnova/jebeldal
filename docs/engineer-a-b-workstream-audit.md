@@ -43,18 +43,19 @@ The user confirmed that Supabase ref `paitemheimctgiqarekt` is the development t
 - Incidents list supports Drafts/Submitted views, draft creation, and resuming an active revision.
 - The draft editor loads every server-pinned form definition, activation status, and scalar answer for a revision. It renders supported typed fields, keeps not-triggered forms read-only, reports unsupported field types, and saves through the versioned answer RPC.
 - The narrative retains user/revision/field-scoped device cache recovery and explicit conflict resolution. Other unsaved field edits are not cached and are preserved only until save or explicit reload.
+- The incident screen now includes an MVP interview panel backed by `select-next-question` and `process-incident-turn`: it shows the server-selected authored prompt, supports text-turn submission, and writes accepted answers through the pinned-field save RPC.
 
 ### Audit fixes completed
 
 - A stale local narrative cache is no longer hidden when the server revision advances. Both copies are presented; the driver can keep the local copy for an explicit save against the current version or discard it in favor of the server copy. Submitted reports remain read-only.
 - Spanish is no longer offered as if supported. The profile UI and client write use English, consistent with the English-only MVP. Spanish remains deferred optional work.
 - The MVP renderer now validates and saves the supported pinned scalar field types and refreshes form activation/status after each successful save. Fields absent from the source definitions are not fabricated.
-- Validation passed: 17 mobile tests, mobile TypeScript check, Expo web export, and four static interview-graph seed tests. No end-to-end browser/device interaction with a hosted user session was performed.
+- Validation passed: 22 mobile tests, mobile TypeScript check, Expo web export, and nine static interview graph/planner tests.
 
 ### Still missing
 
 - Complete authored Auto/GL/WC scalar inventory and demonstrated ≥80% functional data-field coverage; repeatable-group and provenance/source controls. Current seeds define only eight fields and contain no authored sections/labels, so the UI humanizes keys until definitions supply display text.
-- Complete 38-node/17-condition interview, dynamic path/progress, answer states, proposal confirmation, voice UI, transcription, and planner fallback.
+- Interview UX still lacks back-navigation/history review, persisted skip state, unknown/declined state capture, and proposal-confirmation UX. Voice capture/transcription/provider selection remain deferred.
 - Confirm Details and corrections; evidence capture/upload/retry; full Review; device confirmation and submit caller; success/reference view; read-only submitted report detail.
 - Device-level tests for sign-in/profile/Home, draft conflict resolution, restart recovery, and supported permission flows.
 
@@ -76,6 +77,8 @@ The user confirmed that Supabase ref `paitemheimctgiqarekt` is the development t
 - RPCs cover draft creation, answer persistence/versioning, incident detail persistence, turn/evidence persistence, and submission.
 - Definition-aware answer validation, form activation, submission completeness/evidence checks, signatures, immutable submitted snapshots, and retry/idempotency logic are present in source.
 - `submit-incident` authenticates the user bearer token, validates request shape, and forwards the user's JWT to the submit RPC.
+- `process-incident-turn` now authenticates callers, persists text turns through `begin_incident_turn`/`record_incident_turn_result`, and returns explicit `PROVIDER_UNAVAILABLE` for audio while provider work is deferred.
+- `select-next-question` now authenticates callers, reads pinned interview graph + confirmed answers, evaluates all 16 question-level conditions deterministically, and returns the first eligible unanswered question with `selection_source: deterministic_fallback`.
 - Profile completion persistence and RPC existed before this pass; this pass added a trigger so incident creation and the draft-to-submitted transition require a completed driver profile.
 
 ### Audit fixes completed
@@ -83,15 +86,16 @@ The user confirmed that Supabase ref `paitemheimctgiqarekt` is the development t
 - New migration `20261119032133_enforce_profile_completion_for_incidents.sql` enforces profile completion at the database boundary for incident insertion and submission. The pgTAP fixtures and tests were updated to cover incomplete-profile rejection.
 - `SIGNATURE_REFERENCE_REUSED` now maps to a stable 409 response. `PROFILE_INCOMPLETE` maps to 422.
 - The default versioned form set now seeds the 38 authored interview nodes and 17 documented conditions. Four focused static tests pass for node order/count, condition references, unresolved workbook ellipses, and seed synchronization; the hosted seed was applied and the remote counts were verified.
+- Hosted development functions were deployed at version 2 for `process-incident-turn` and `select-next-question`. Authenticated smoke checks verified deterministic question selection and completed text-turn persistence; unauthenticated requests return `AUTH_REQUIRED` as expected.
 
 ### Still missing or unverified
 
 - The Auto/GL/WC scalar-field seed remains a small subset and does not establish complete mockup-field coverage or the ≥80% functional data-field target. The image provides layout and labels, but not stable keys, types, requiredness, validation, or options; do not invent them.
-- The graph conditions are source metadata, not an executable eligibility/path/progress evaluator; AI may not own these rules. The interview UI and evaluator response contract remain incomplete.
+- Condition evaluation exists for the current 16 question expressions, but skip persistence and non-confirmed answer-state progression are not yet represented in the selection contract.
 - SQL test files declare 54 and 15 assertions, but neither suite was executed in this pass because `supabase test db --remote` stopped at the Docker requirement. The transaction-wrapped hosted profile-gate smoke passed; full RLS/persistence suites remain unverified.
 - The three missing repository migrations are now applied to hosted development, and the six-version migration history, profile columns/RPC/trigger, three active form definitions, and graph counts were verified read-only.
 - Driver-files metadata creation/finalization, complete read/list/detail/resume projections, and complete client-facing field/provenance/evidence validation responses need closure against the architecture contract.
-- `process-incident-turn` and `select-next-question` are outside B's mobile/data scope for this audit and remain reported 501 stubs (Engineer C work).
+- Audio turn completion remains intentionally unavailable until Engineer C provider integrations and evidence upload workflows are finished; current behavior is an explicit retryable error, not a success fallback.
 
 ## Engineer B implementation plan
 

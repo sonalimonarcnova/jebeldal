@@ -15,6 +15,16 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { useAuth } from '../../src/auth/AuthProvider';
 import {
+  createClientTurnId,
+  findPinnedQuestionMapping,
+  questionAnswerText,
+  type InterviewQuestion,
+} from '../../src/features/incidents/questionFlow';
+import {
+  processIncidentTextTurn,
+  selectNextQuestion,
+} from '../../src/features/incidents/questionFlowRepository';
+import {
   clearCachedDraftText,
   readCachedDraftText,
   writeCachedDraftText,
@@ -91,14 +101,16 @@ function IncidentFieldEditor({
   onChange,
   disabled,
   readOnly,
+  promptOverride,
 }: {
   field: FormFieldDefinition;
   value: unknown;
   onChange: (value: unknown) => void;
   disabled: boolean;
   readOnly: boolean;
+  promptOverride?: string;
 }) {
-  const label = getFieldPrompt(field);
+  const label = promptOverride ?? getFieldPrompt(field);
   if (readOnly) {
     return (
       <View style={styles.fieldControl}>
@@ -231,8 +243,18 @@ export default function IncidentDraftRoute() {
   const [localMessage, setLocalMessage] = useState<string | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const [nextQuestion, setNextQuestion] = useState<InterviewQuestion | null>(null);
+  const [interviewComplete, setInterviewComplete] = useState(false);
+  const [questionLoading, setQuestionLoading] = useState(false);
+  const [questionError, setQuestionError] = useState<string | null>(null);
+  const [questionAnswer, setQuestionAnswer] = useState<unknown>('');
+  const [submittingTurn, setSubmittingTurn] = useState(false);
+  const [turnMessage, setTurnMessage] = useState<string | null>(null);
   const dirtyFieldsRef = useRef<DirtyFields>({});
   const savedValuesRef = useRef<FieldValues>({});
+  const draftRef = useRef<IncidentDraft | null>(draft);
+  const pendingTurnRef = useRef<{ questionId: string; text: string; clientTurnId: string } | null>(null);
+  draftRef.current = draft;
 
   const replaceDirtyFields = (next: DirtyFields) => {
     dirtyFieldsRef.current = next;
@@ -521,6 +543,194 @@ export default function IncidentDraftRoute() {
     }
   };
 
+  const loadNextQuestion = useCallback(async () => {
+    const currentDraft = draftRef.current;
+    if (!revisionId || currentDraft?.status !== 'draft') {
+      setNextQuestion(null);
+      setInterviewComplete(false);
+      return;
+    }
+    setQuestionLoading(true);
+    setQuestionError(null);
+    try {
+      const result = await selectNextQuestion(revisionId);
+      if (result.kind === 'complete') {
+        setNextQuestion(null);
+        setInterviewComplete(true);
+        setQuestionAnswer('');
+      } else {
+        setNextQuestion(result.question);
+        setInterviewComplete(false);
+        const field = currentDraft
+          ? findPinnedQuestionMapping(result.question, currentDraft.forms)?.field ?? null
+          : null;
+        setQuestionAnswer(field ? initialFieldValue(field, null) : '');
+      }
+      setTurnMessage(null);
+    } catch (error) {
+      setNextQuestion(null);
+      setInterviewComplete(false);
+      setQuestionError(
+        error instanceof Error
+          ? `Question selection is unavailable: ${error.message}`
+          : 'Question selection is unavailable. Retry when the service is available.',
+      );
+    } finally {
+      setQuestionLoading(false);
+    }
+  }, [revisionId]);
+
+  useEffect(() => {
+    if (draft?.status === 'draft') {
+      void loadNextQuestion();
+    }
+  }, [draft?.status, draft?.version, loadNextQuestion]);
+
+  const submitInterviewAnswer = async () => {
+    if (!draft || !revisionId || !nextQuestion || !session?.user.id) {
+      return;
+    }
+    const mapping = findPinnedQuestionMapping(nextQuestion, draft.forms);
+    if (!mapping) {
+      setQuestionError('This question is not in the pinned form definitions, so it is read-only and cannot be saved as an answer.');
+      return;
+    }
+    const { field } = mapping;
+
+    const parsed = validateFieldValue(field, questionAnswer);
+    if (!parsed.ok) {
+      setQuestionError(parsed.error);
+      return;
+    }
+    const text = questionAnswerText(field, parsed.value);
+    if (!text) {
+      setQuestionError('Enter an answer before submitting this turn.');
+      return;
+    }
+
+    const fieldId = formFieldId(mapping.formKey, nextQuestion.fieldKey);
+    if (dirtyFieldsRef.current[fieldId]) {
+      setQuestionError('Save or discard this field’s existing edits before answering it in the interview.');
+      return;
+    }
+    if (fieldId === narrativeId && narrativeDirty) {
+      setQuestionError('Save the incident narrative first so this answer uses the current server revision.');
+      return;
+    }
+
+    const questionId = `${nextQuestion.formKey ?? ''}:${nextQuestion.fieldKey}`;
+    if (pendingTurnRef.current?.questionId !== questionId || pendingTurnRef.current.text !== text) {
+      pendingTurnRef.current = { questionId, text, clientTurnId: createClientTurnId() };
+    }
+    const pendingTurn = pendingTurnRef.current;
+    setSubmittingTurn(true);
+    setQuestionError(null);
+    setTurnMessage(null);
+    let turnAccepted = false;
+    try {
+      await processIncidentTextTurn({
+        revisionId,
+        clientTurnId: pendingTurn.clientTurnId,
+        text: pendingTurn.text,
+      });
+      turnAccepted = true;
+      const draftAfterTurn = await loadIncidentDraft(revisionId);
+      const nextVersion = await saveIncidentFieldAnswer(
+        draftAfterTurn,
+        mapping.formKey,
+        nextQuestion.fieldKey,
+        parsed.value as FormJsonValue,
+        draftAfterTurn.version,
+      );
+      pendingTurnRef.current = null;
+      setDraft((current) => current ? { ...current, version: nextVersion } : current);
+      markFieldDirty(fieldId, false);
+      let cacheCleanupError: string | null = null;
+      if (fieldId === narrativeId && draft.fieldKey) {
+        try {
+          await clearCachedDraftText(session.user.id, revisionId, draft.fieldKey);
+        } catch {
+          cacheCleanupError = 'The answer was saved, but local narrative cache cleanup failed.';
+        }
+      }
+      try {
+        const refreshedDraft = await loadIncidentDraft(revisionId);
+        const refreshedValues = getFieldValues(refreshedDraft);
+        savedValuesRef.current = refreshedValues;
+        setDraft(refreshedDraft);
+        setFieldValues((current) => {
+          const next = { ...refreshedValues };
+          for (const [dirtyId, dirty] of Object.entries(dirtyFieldsRef.current)) {
+            if (dirty && dirtyId !== fieldId) {
+              next[dirtyId] = current[dirtyId];
+            }
+          }
+          return next;
+        });
+        setTurnMessage(cacheCleanupError ?? 'Turn accepted and answer saved.');
+        if (cacheCleanupError) {
+          setErrorText(cacheCleanupError);
+        }
+      } catch {
+        setNeedsRefresh(true);
+        setTurnMessage('Turn accepted and answer saved to the server.');
+        setErrorText('The answer was saved, but the latest form state could not be reloaded.');
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'The turn could not be submitted.';
+      if (turnAccepted) {
+        setNeedsRefresh(true);
+      } else {
+        try {
+          setDraft(await loadIncidentDraft(revisionId));
+        } catch {
+          // Keep the draft visible; retrying with the stable turn ID remains safe.
+        }
+      }
+      setQuestionError(
+        turnAccepted
+          ? `The turn was accepted, but its answer was not saved. Reload the server form before retrying; the same turn ID will be reused. ${message}`
+          : `Turn processing is unavailable; the answer was not saved. ${message}`,
+      );
+    } finally {
+      setSubmittingTurn(false);
+    }
+  };
+
+  const skipUnmappedQuestion = async () => {
+    if (!nextQuestion || !revisionId) {
+      return;
+    }
+    setQuestionLoading(true);
+    setQuestionError(null);
+    try {
+      const result = await selectNextQuestion(revisionId);
+      if (result.kind === 'complete') {
+        setNextQuestion(null);
+        setInterviewComplete(true);
+      } else if (
+        result.question.formKey === nextQuestion.formKey
+        && result.question.fieldKey === nextQuestion.fieldKey
+      ) {
+        setQuestionError(
+          'The server selected this question again. The current backend contract does not record skipped questions, so it cannot advance past this item yet.',
+        );
+      } else {
+        setNextQuestion(result.question);
+        const field = draft
+          ? findPinnedQuestionMapping(result.question, draft.forms)?.field ?? null
+          : null;
+        setQuestionAnswer(field ? initialFieldValue(field, null) : '');
+      }
+    } catch (error) {
+      setQuestionError(
+        error instanceof Error ? error.message : 'Could not request the next question.',
+      );
+    } finally {
+      setQuestionLoading(false);
+    }
+  };
+
   const reloadServerForm = async () => {
     if (!draft || !revisionId || !session?.user.id) {
       return;
@@ -571,6 +781,14 @@ export default function IncidentDraftRoute() {
     || savingFieldId !== null
     || needsRefresh
     || cacheConflict !== null;
+  const questionMapping = nextQuestion
+    ? findPinnedQuestionMapping(nextQuestion, draft.forms)
+    : null;
+  const questionField = questionMapping?.field ?? null;
+  const questionFieldForm = questionMapping
+    ? draft.forms.find((form) => form.formKey === questionMapping.formKey) ?? null
+    : null;
+  const questionUsesFallback = /fallback|rule/i.test(nextQuestion?.selectionSource ?? '');
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -583,6 +801,97 @@ export default function IncidentDraftRoute() {
         </View>
         {readOnly ? (
           <Text variant="bodyMedium">Submitted reports are read-only.</Text>
+        ) : null}
+        {!readOnly ? (
+          <Card>
+            <Card.Content style={styles.cardContent}>
+              <Text variant="titleMedium">Incident interview</Text>
+              <Text variant="bodySmall">
+                Text answers are sent to the server turn processor and saved only after it accepts the turn. Voice recording and provider-backed transcription are deferred and unavailable here.
+              </Text>
+              {questionLoading ? (
+                <ActivityIndicator accessibilityLabel="Selecting next question" />
+              ) : null}
+              {interviewComplete ? (
+                <HelperText type="info" visible>
+                  Interview complete. The server reports that no eligible questions remain.
+                </HelperText>
+              ) : null}
+              {questionError ? <HelperText type="error" visible>{questionError}</HelperText> : null}
+              {nextQuestion ? (
+                <>
+                  {questionUsesFallback ? (
+                    <HelperText type="info" visible>
+                      The question planner used the server’s deterministic rule-order fallback.
+                    </HelperText>
+                  ) : null}
+                  {questionField && questionFieldForm ? (
+                    <>
+                      <IncidentFieldEditor
+                        field={questionField}
+                        value={questionAnswer}
+                        onChange={(value) => {
+                          setQuestionAnswer(value);
+                          setQuestionError(null);
+                        }}
+                        disabled={controlsDisabled || questionLoading || submittingTurn}
+                        readOnly={
+                          !questionFieldForm
+                          || questionFieldForm.activationStatus !== 'triggered'
+                          || questionField.configurationError !== null
+                        }
+                        promptOverride={nextQuestion.prompt}
+                      />
+                      {questionFieldForm.activationStatus !== 'triggered' ? (
+                        <HelperText type="error" visible>
+                          The selected question belongs to a form that is not active in this draft; it cannot be answered.
+                        </HelperText>
+                      ) : null}
+                      <Button
+                        mode="contained"
+                        onPress={() => void submitInterviewAnswer()}
+                        disabled={
+                          controlsDisabled
+                          || questionLoading
+                          || submittingTurn
+                          || questionField.configurationError !== null
+                          || questionFieldForm.activationStatus !== 'triggered'
+                        }
+                        loading={submittingTurn}
+                      >
+                        Submit text answer
+                      </Button>
+                    </>
+                  ) : (
+                    <>
+                      <Text variant="titleSmall">{nextQuestion.prompt}</Text>
+                      {nextQuestion.options.map((option) => (
+                        <Text key={option.value} variant="bodyMedium">• {option.label}</Text>
+                      ))}
+                      <HelperText type="error" visible>
+                        This question key is not present in the pinned form definitions. It is read-only; no field key or answer mapping will be invented.
+                      </HelperText>
+                      <Button
+                        mode="outlined"
+                        onPress={() => void skipUnmappedQuestion()}
+                        disabled={questionLoading || submittingTurn}
+                      >
+                        Skip and request next question
+                      </Button>
+                    </>
+                  )}
+                </>
+              ) : null}
+              {turnMessage ? <HelperText type="info" visible>{turnMessage}</HelperText> : null}
+              <Button
+                mode="outlined"
+                onPress={() => void loadNextQuestion()}
+                disabled={questionLoading || submittingTurn}
+              >
+                Refresh question
+              </Button>
+            </Card.Content>
+          </Card>
         ) : null}
         {cacheConflict && narrativeId ? (
           <Card>

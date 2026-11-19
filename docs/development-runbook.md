@@ -192,6 +192,8 @@ All RPC calls use the signed-in driver's Supabase client/JWT. Clients may read t
 | Engineer C | Evidence | Create metadata with `create_incident_evidence` (`p_incident_revision_id`, media type, byte size, optional description), upload to the returned exact path in private `incident-evidence`, then call `finalize_incident_evidence(p_evidence_id)`. Finalize checks object existence, MIME family/allowlist, and exact size. Upload replacement is allowed only for a pending/failed draft object; uploaded evidence cannot be replaced. Use Storage signed URLs for playback/viewing. |
 | Engineer A | Submit | `POST /functions/v1/submit-incident` with `incident_revision_id`, `expected_version`, UUID `signature_reference`, `auth_method` (`biometric` or `device_passcode`), and `device_description`. Success returns `status: submitted`, `driver_status: Submitted · awaiting review`, `report_reference`, `submitted_at`, and new version. A retry with the same confirmation reference returns the original result. |
 
+The MVP `process-incident-turn` function completes text turns with the submitted text as transcript and `proposals: []`. Audio turns are persisted as failed with `PROVIDER_UNAVAILABLE` and HTTP 503; callers can use text input while provider integration is deferred. `select-next-question` evaluates the pinned graph and confirmed answers without a provider, returning the first eligible unanswered question in graph order.
+
 The expected version advances on answer, details, group, new-turn, and evidence create/finalize writes. Clients must use the returned version for the next mutation or submit. Submit validation returns HTTP 422 with `{ "code": "VALIDATION_FAILED", "issues": [{ "form_key", "field_key", "group_instance_id?", "code" }] }`. Other stable function errors include `AUTH_REQUIRED` (401), `NOT_ALLOWED` (403), `STALE_VERSION` / `INCIDENT_NOT_DRAFT` / `SIGNATURE_REFERENCE_REUSED` (409), and `RETRYABLE_FAILURE` (503). Database RPC errors carry SQLSTATE `P0001` with the stable code in `message`.
 
 ## Hosted Supabase deployment workflow
@@ -234,7 +236,7 @@ npm run supabase:functions:deploy
 ## Current next implementation steps
 
 1. Engineer A consumes the draft, answer, details, and read contracts in the mobile flow.
-2. Engineer C implements provider processing and eligible-question planning using the turn/evidence persistence contracts.
+2. Engineer C adds provider transcription/extraction to the persisted turn contract; deterministic eligibility and fallback planning are implemented by the Edge Function slice.
 3. Replace the minimal backend fixture definitions with the reviewed complete form definitions and workbook branch rules.
 4. Verify hosted invite-only Auth settings and run physical-device, upload-retry, and full driver-journey acceptance outside the local database suite.
 
