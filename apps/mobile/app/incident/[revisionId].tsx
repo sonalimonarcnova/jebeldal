@@ -18,6 +18,7 @@ import {
   Checkbox,
   Chip,
   HelperText,
+  IconButton,
   Menu,
   ProgressBar,
   SegmentedButtons,
@@ -89,6 +90,18 @@ import {
   type PendingSubmission,
 } from '../../src/features/incidents/submissionCache';
 import type { SubmitIssue } from '../../src/features/incidents/rpcOperations';
+import { processTurn, saveAcceptedProposals, type ProcessTurnInput } from '../../src/lib/api';
+import { uploadEvidence } from '../../src/lib/evidence';
+import { useQuestionSpeech } from '../../src/features/voice/useQuestionSpeech';
+import { VoiceAnswerPanel, type VoicePanelFailure } from '../../src/features/voice/VoiceAnswerPanel';
+import {
+  choiceSuggestions,
+  fieldId as voiceFieldId,
+  isStoryQuestion,
+  runVoiceTurn,
+  type PendingVoiceTurn,
+  type VoiceProposal,
+} from '../../src/features/voice/voiceTurn';
 
 type FieldValues = Record<string, unknown>;
 type DirtyFields = Record<string, boolean>;
@@ -503,6 +516,21 @@ export default function IncidentDraftRoute() {
   const historyOffsetRef = useRef(0);
   const submitInFlightRef = useRef(false);
   draftRef.current = draft;
+
+  // Voice answering (ST-13, ST-14, ST-15, ST-25).
+  const [voiceBusy, setVoiceBusy] = useState(false);
+  const [voiceTranscript, setVoiceTranscript] = useState<string | null>(null);
+  const [voiceFailure, setVoiceFailure] = useState<VoicePanelFailure | null>(null);
+  /** fieldId ("form.field") of the current question when its answer was pre-selected from the driver's story */
+  const [suggestedFor, setSuggestedFor] = useState<string | null>(null);
+  /** in-flight voice/story turn; a retry resumes it with the same client_turn_id */
+  const voiceTurnRef = useRef<PendingVoiceTurn | null>(null);
+  /** choice suggestions from the last turn, applied when their question comes up (never auto-saved) */
+  const suggestionsRef = useRef<Map<string, VoiceProposal>>(new Map());
+  const speech = useQuestionSpeech(
+    nextQuestion ? `${nextQuestion.formKey ?? ''}:${nextQuestion.fieldKey}` : null,
+    nextQuestion?.prompt ?? null,
+  );
 
   useEffect(() => {
     fieldValuesRef.current = fieldValues;
@@ -1000,10 +1028,17 @@ export default function IncidentDraftRoute() {
       } else {
         setNextQuestion(result.question);
         setInterviewComplete(false);
-        const field = currentDraft
-          ? findPinnedQuestionMapping(result.question, currentDraft.forms)?.field ?? null
-          : null;
-        setQuestionAnswer(field ? initialFieldValue(field, null) : '');
+        const mapping = currentDraft ? findPinnedQuestionMapping(result.question, currentDraft.forms) : null;
+        const field = mapping?.field ?? null;
+        // A choice the driver already mentioned is pre-selected ("from your story"); one tap confirms it.
+        const suggestion = mapping ? suggestionsRef.current.get(voiceFieldId(mapping.formKey, result.question.fieldKey)) : undefined;
+        if (field && suggestion && validateFieldValue(field, suggestion.value).ok) {
+          setQuestionAnswer(suggestion.value);
+          setSuggestedFor(voiceFieldId(mapping!.formKey, result.question.fieldKey));
+        } else {
+          setQuestionAnswer(field ? initialFieldValue(field, null) : '');
+          setSuggestedFor(null);
+        }
       }
       setTurnMessage(null);
     } catch (error) {
@@ -1054,6 +1089,21 @@ export default function IncidentDraftRoute() {
     }
     if (fieldId === narrativeId && narrativeDirty) {
       setQuestionError('Save the incident narrative first so this answer uses the current server revision.');
+      return;
+    }
+
+    // A typed story goes through the voice pipeline too, so it fills every field it mentions (ST-25).
+    if (typeof parsed.value === 'string' && isStoryQuestion(nextQuestion.prompt, field.type)) {
+      const current = voiceTurnRef.current;
+      const sameTyped = current?.input.kind === 'text'
+        && current.input.text === parsed.value
+        && current.question.formKey === mapping.formKey
+        && current.question.fieldKey === nextQuestion.fieldKey;
+      await runVoice(sameTyped && current ? current : {
+        clientTurnId: createClientTurnId(),
+        question: { formKey: mapping.formKey, fieldKey: nextQuestion.fieldKey },
+        input: { kind: 'text', text: parsed.value },
+      });
       return;
     }
 
@@ -1136,6 +1186,93 @@ export default function IncidentDraftRoute() {
     } finally {
       setSubmittingTurn(false);
     }
+  };
+
+  /**
+   * Runs (or resumes) a voice / typed-story turn: upload → process-incident-turn → save the applied proposals the
+   * driver has not answered yet → refresh → next question. Suggestions are kept for pre-selection, never saved.
+   */
+  const runVoice = async (pending: PendingVoiceTurn) => {
+    if (!revisionId || !session?.user.id) return;
+    voiceTurnRef.current = pending;
+    setVoiceBusy(true);
+    setVoiceFailure(null);
+    setQuestionError(null);
+    setTurnMessage(null);
+    speech.stop();
+    const versionBefore = draftRef.current?.version;
+    try {
+      const outcome = await runVoiceTurn(pending, {
+        uploadAudio: async ({ uri, evidenceId }) => {
+          const uploaded = await uploadEvidence({
+            revisionId,
+            uri,
+            mediaType: 'audio',
+            questionKey: voiceFieldId(pending.question.formKey, pending.question.fieldKey),
+            evidenceId,
+          });
+          return { evidenceId: uploaded.evidenceId };
+        },
+        processTurn: (args) => processTurn({ incident_revision_id: revisionId, ...args } as ProcessTurnInput),
+        saveAccepted: (proposals) => saveAcceptedProposals(revisionId, proposals),
+        answeredFields: () =>
+          new Set(
+            (draftRef.current?.answers ?? [])
+              .filter((answer) => answer.groupInstanceId === null)
+              .map((answer) => voiceFieldId(answer.formKey, answer.fieldKey)),
+          ),
+      });
+      if (pending.response) setVoiceTranscript(pending.response.transcript);
+      if (!outcome.ok) {
+        // Partially saved answers must count as answered when the driver retries.
+        if (outcome.failure.stage === 'save') await refreshDraftPreservingDirty().catch(() => undefined);
+        setVoiceFailure({ message: outcome.failure.message, retryable: outcome.failure.retryable });
+        return;
+      }
+
+      voiceTurnRef.current = null;
+      const currentDraft = draftRef.current;
+      suggestionsRef.current = choiceSuggestions(outcome.response.suggested, (formKey, fieldKey) =>
+        currentDraft ? findAnswerField(currentDraft, formKey, fieldKey, null)?.type ?? null : null,
+      );
+      const storyFieldId = formFieldId(pending.question.formKey, pending.question.fieldKey);
+      if (storyFieldId === narrativeId && currentDraft?.fieldKey) {
+        await clearCachedDraftText(session.user.id, revisionId, currentDraft.fieldKey).catch(() => undefined);
+      }
+      const refreshed = await refreshDraftPreservingDirty();
+      // The draft version effect reloads the next question; reload explicitly if nothing changed the version.
+      if (refreshed.version === versionBefore) void loadNextQuestion();
+      const savedCount = outcome.saved.length;
+      setTurnMessage(
+        savedCount > 0
+          ? `Filled ${savedCount} answer${savedCount === 1 ? '' : 's'} from what you said.${
+            outcome.skippedAnswered.length ? ` Kept ${outcome.skippedAnswered.length} you had already answered.` : ''}`
+          : 'We heard you, but nothing new could be filled in. Please answer this question directly.',
+      );
+    } catch (error) {
+      setVoiceFailure({ message: errorMessage(error, 'Something went wrong with that answer. Please try again.'), retryable: true });
+    } finally {
+      setVoiceBusy(false);
+    }
+  };
+
+  /** Mic finished: a new turn for the current question. */
+  const startVoiceAnswer = (uri: string) => {
+    if (!draft || !nextQuestion) return;
+    const mapping = findPinnedQuestionMapping(nextQuestion, draft.forms);
+    if (!mapping) {
+      setVoiceFailure({ message: 'This question cannot be answered here yet. Please skip it or try another one.', retryable: false });
+      return;
+    }
+    if (narrativeDirty) {
+      setVoiceFailure({ message: 'Save the incident narrative first, then record your answer.', retryable: false });
+      return;
+    }
+    void runVoice({
+      clientTurnId: createClientTurnId(),
+      question: { formKey: mapping.formKey, fieldKey: nextQuestion.fieldKey },
+      input: { kind: 'audio', uri },
+    });
   };
 
   const saveInterviewAnswerState = async (answerState: PersistedAnswerState) => {
@@ -1662,6 +1799,14 @@ export default function IncidentDraftRoute() {
           <Text variant="labelLarge">
             {readOnly ? 'Submitted' : 'Draft'} · revision {draft.version}
           </Text>
+          {!readOnly ? (
+            <IconButton
+              icon={speech.muted ? 'volume-off' : 'volume-high'}
+              onPress={speech.toggleMute}
+              accessibilityLabel={speech.muted ? 'Read questions aloud' : 'Stop reading questions aloud'}
+              size={24}
+            />
+          ) : null}
         </View>
         {readOnly ? (
           <Card>
@@ -1787,7 +1932,7 @@ export default function IncidentDraftRoute() {
             <Card.Content style={styles.cardContent}>
               <Text variant="titleMedium">Incident interview</Text>
               <Text variant="bodySmall">
-                Text answers are sent to the server turn processor and saved only after it accepts the turn. Voice recording and provider-backed transcription are deferred and unavailable here.
+                Answer by voice or by typing. When you describe what happened, we fill in every question your story answers and skip them.
               </Text>
               {questionLoading ? (
                 <ActivityIndicator accessibilityLabel="Selecting next question" />
@@ -1807,14 +1952,50 @@ export default function IncidentDraftRoute() {
                   ) : null}
                   {questionField && questionMapping ? (
                     <>
+                      <Button
+                        mode="text"
+                        icon="volume-high"
+                        onPress={speech.replay}
+                        style={styles.hearAgain}
+                        contentStyle={styles.hearAgainContent}
+                        accessibilityLabel={`Hear the question again: ${nextQuestion.prompt}`}
+                      >
+                        Hear it again
+                      </Button>
+                      <VoiceAnswerPanel
+                        disabled={
+                          controlsDisabled
+                          || questionLoading
+                          || submittingTurn
+                          || questionField.configurationError !== null
+                        }
+                        busy={voiceBusy}
+                        transcript={voiceTranscript}
+                        failure={voiceFailure}
+                        onRecorded={startVoiceAnswer}
+                        onRetry={() => {
+                          if (voiceTurnRef.current) void runVoice(voiceTurnRef.current);
+                        }}
+                        onTypeInstead={() => {
+                          setVoiceFailure(null);
+                          setTurnMessage('Type your answer below and tap Submit.');
+                        }}
+                        onBeforeRecord={speech.stop}
+                      />
+                      {suggestedFor === voiceFieldId(questionMapping.formKey, nextQuestion.fieldKey) ? (
+                        <Chip compact icon="star-four-points-outline" style={styles.fromStory}>
+                          From your story — check it and tap Confirm
+                        </Chip>
+                      ) : null}
                       <IncidentFieldEditor
                         field={questionField}
                         value={questionAnswer}
                         onChange={(value) => {
                           setQuestionAnswer(value);
                           setQuestionError(null);
+                          setSuggestedFor(null);
                         }}
-                        disabled={controlsDisabled || questionLoading || submittingTurn}
+                        disabled={controlsDisabled || questionLoading || submittingTurn || voiceBusy}
                         readOnly={questionField.configurationError !== null}
                         promptOverride={nextQuestion.prompt}
                       />
@@ -1825,11 +2006,14 @@ export default function IncidentDraftRoute() {
                           controlsDisabled
                           || questionLoading
                           || submittingTurn
+                          || voiceBusy
                           || questionField.configurationError !== null
                         }
                         loading={submittingTurn}
                       >
-                        Submit text answer
+                        {suggestedFor === voiceFieldId(questionMapping.formKey, nextQuestion.fieldKey)
+                          ? 'Confirm answer'
+                          : 'Submit text answer'}
                       </Button>
                       <Text variant="labelMedium">Or save a response status</Text>
                       <View style={styles.choiceRow}>
@@ -2496,6 +2680,15 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 12,
+  },
+  hearAgain: {
+    alignSelf: 'flex-start',
+  },
+  hearAgainContent: {
+    minHeight: 48,
+  },
+  fromStory: {
+    alignSelf: 'flex-start',
   },
   dropdownButton: {
     alignSelf: 'stretch',

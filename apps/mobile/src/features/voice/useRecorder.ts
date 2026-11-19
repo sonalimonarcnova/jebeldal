@@ -8,22 +8,21 @@ import {
 } from 'expo-audio';
 import { File } from 'expo-file-system';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { Platform } from 'react-native';
+
+import { normaliseMetering, shouldLogMeterSample } from './meter';
+
+export { normaliseMetering } from './meter';
 
 export type RecorderUiState = 'idle' | 'recording' | 'processing' | 'denied' | 'error';
 
 export const MAX_RECORDING_SECONDS = 180;
 const LEVEL_COUNT = 40;
 const POLL_MS = 100;
-/** Metering is dBFS (≈ -160 silent … 0 loud). Speech sits roughly in -50…-10, so map -60…0 → 0…1. */
-const METER_FLOOR_DB = -60;
 
-// HIGH_QUALITY = m4a container, AAC encoder, 44.1 kHz on iOS and Android.
+// HIGH_QUALITY = m4a container, AAC encoder, 44.1 kHz on iOS and Android. Metering must be enabled here:
+// expo-audio reads isMeteringEnabled when the recorder is created (Android) / prepared (iOS).
 const OPTIONS: RecordingOptions = { ...RecordingPresets.HIGH_QUALITY, isMeteringEnabled: true };
-
-export function normaliseMetering(db: number | undefined): number {
-  if (db === undefined || !Number.isFinite(db)) return 0;
-  return Math.min(1, Math.max(0, (db - METER_FLOOR_DB) / -METER_FLOOR_DB));
-}
 
 export type UseRecorderOptions = {
   /** Called once per finished recording, both for a manual stop() and the 180 s auto-stop. Not called on cancel(). */
@@ -74,6 +73,7 @@ export function useRecorder({ onFinished, maxSeconds = MAX_RECORDING_SECONDS }: 
   const stoppingRef = useRef(false);
   /** True once the polled status has shown isRecording for the current session (guards against stale polls). */
   const sawRecordingRef = useRef(false);
+  const meterSamplesRef = useRef(0);
   const onFinishedRef = useRef(onFinished);
   onFinishedRef.current = onFinished;
 
@@ -139,6 +139,7 @@ export function useRecorder({ onFinished, maxSeconds = MAX_RECORDING_SECONDS }: 
       await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
       await recorder.prepareToRecordAsync();
       sawRecordingRef.current = false;
+      meterSamplesRef.current = 0;
       // forDuration is the native backstop; the effect below also stops at maxSeconds so onFinished fires.
       recorder.record({ forDuration: maxSeconds });
       setLastFileBytes(null);
@@ -183,6 +184,11 @@ export function useRecorder({ onFinished, maxSeconds = MAX_RECORDING_SECONDS }: 
     if (status.isRecording) {
       sawRecordingRef.current = true;
       const level = normaliseMetering(status.metering);
+      if (__DEV__ && shouldLogMeterSample(meterSamplesRef.current)) {
+        // Dev only: proves metering arrives (a flat waveform with `metering: undefined` = metering not enabled).
+        console.log(`[voice] ${Platform.OS} metering #${meterSamplesRef.current}: ${status.metering ?? 'undefined'} dB → ${level.toFixed(2)}`);
+      }
+      meterSamplesRef.current += 1;
       setLevels((prev) => (prev.length >= LEVEL_COUNT ? [...prev.slice(prev.length - LEVEL_COUNT + 1), level] : [...prev, level]));
     }
     const hitCap = status.isRecording && status.durationMillis >= maxSeconds * 1000;
