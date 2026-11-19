@@ -19,7 +19,7 @@ Related: [MVP technical architecture](./architecture.md) · [MVP user flows and 
 | Node.js 22+ | Expo toolchain | Current scaffold was generated with Node 22. |
 | npm | Workspace script runner | Root scripts orchestrate mobile and Supabase checks. |
 | Hosted Supabase project | Auth, Postgres, Storage, Edge Functions | Current project URL is already configured externally. |
-| Supabase CLI (`supabase`) | Hosted migration/function operations | Use `--remote=<project_ref>` for hosted operations. |
+| Supabase CLI (`supabase`) | Local migrations, database tests, and hosted operations | Local config targets CLI 3.2.0; use `npx --yes supabase@3.2.0` for the local workflow below. |
 | Infisical CLI (`infisical`) | Environment-specific secrets injection | Use your real Infisical slugs (`dev`, `staging`, `prod`) unless your project defines different ones. |
 | Physical iOS/Android device | Validate microphone/camera/upload behavior | Simulator is not enough for final voice/media verification. |
 
@@ -90,7 +90,7 @@ This confirms:
 
 ## Seeded development accounts
 
-Use the scripted seed to create Auth users + matching `public.profiles` rows in hosted Supabase.
+Use the scripted seed to create invited development Auth users, matching `public.profiles` rows, and fictional `trip_records`. It can target local or hosted development; set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` for the intended environment first.
 
 Prerequisites:
 - `SUPABASE_SERVICE_ROLE_KEY` is available in your shell (recommended via Infisical).
@@ -108,9 +108,8 @@ Created accounts:
 |---|---|---|
 | driver | `driver+dev1@jebel.local` | `DevDriver#101` |
 | driver | `driver+dev2@jebel.local` | `DevDriver#102` |
-| manager | `manager+dev@jebel.local` | `DevManager#201` |
 
-The script is idempotent and safe to re-run: it reuses existing users by email and upserts profile rows.
+The script is idempotent and safe to re-run: it reuses existing users by email and upserts profiles and trip fixtures. It does not create a manager account. The legacy `manager` profile enum remains for existing-data compatibility, but Engineer B's policies and RPCs only authorize `driver` profiles.
 
 ## Run commands (hosted Supabase)
 
@@ -133,7 +132,7 @@ npm run mobile:start:infisical:staging
 npm run mobile:start:infisical:prod
 ```
 
-`mobile:start` exists but does **not** inject Infisical values. Prefer `mobile:start:infisical:*` for team usage.  
+`mobile:start` defaults to the Infisical `dev` environment so Android does not accidentally use a host-only local Supabase URL. Use `mobile:start:local` only when intentionally targeting a running local Supabase stack and its environment is configured.  
 Compatibility aliases also exist: `mobile:start:infisical:development` and `mobile:start:infisical:production`.
 
 Other useful hosted commands:
@@ -155,6 +154,45 @@ npx supabase status -o env --override-name api.url=EXPO_PUBLIC_SUPABASE_URL --ov
 
 Copy the printed `EXPO_PUBLIC_SUPABASE_URL` and `EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY` into your runtime environment (or local `.env`) before running mobile.  
 For physical phones, replace `127.0.0.1` with your machine's LAN IP.
+
+## Local backend verification (Engineer B)
+
+JebelDAL uses ports `55420`–`55429` so its local stack can coexist with the separate `jebelai-backend` experiment on the default Supabase ports. Keep this workflow local; do not add `--remote` or `--linked`. Local Auth sign-ups are disabled; the service-role seed script creates the fictional invited users.
+
+From the repository root in PowerShell:
+
+```powershell
+npx --yes supabase@3.2.0 start
+npx --yes supabase@3.2.0 db reset --local
+$local = npx --yes supabase@3.2.0 status -o env | ConvertFrom-StringData
+$env:SUPABASE_URL = $local.API_URL.Trim([char]34)
+$env:SUPABASE_SERVICE_ROLE_KEY = $local.SERVICE_ROLE_KEY.Trim([char]34)
+npm run seed:dev-accounts
+npx --yes supabase@3.2.0 test db
+./scripts/test-local-submit.ps1
+```
+
+`db reset` is destructive to the JebelDAL local database only; rerun the account seed after resetting. `test db` runs the focused pgTAP suite for authorization, versioned saves, branch/form activation, evidence handling, validation, stale submit, and idempotency. The PowerShell smoke script signs in with the first fictional driver, saves a complete fixture report, sends two simultaneous requests through the local Edge Function, and verifies both plus a later retry return the same report reference. Stop only this project with `npx --yes supabase@3.2.0 stop` when finished.
+
+The checked-in definitions in `supabase/seed.sql` are minimal persistence fixtures for the three form keys. They exercise deterministic activation and submit blocking; they are not the complete ACORD demo forms, do not implement the 38-question graph, and must not be treated as carrier forms. Hosted Auth configuration was not inspected or changed; invite-only hosted access must be verified separately.
+
+### Persistence contracts
+
+All RPC calls use the signed-in driver's Supabase client/JWT. Clients may read their own reports through RLS but cannot directly insert or update lifecycle rows.
+
+| Owner | Operation | Request and result |
+|---|---|---|
+| Engineer A | Create draft | `POST /rest/v1/rpc/create_incident_draft` with `p_form_set_key`, `p_form_set_version`, `p_language`; returns the new revision UUID. The server derives owner and organization. |
+| Engineer A | Save answer | `POST /rest/v1/rpc/save_incident_answer` with `p_incident_revision_id`, `p_expected_version`, `p_form_key`, `p_field_key`, optional `p_group_instance_id`, `p_value`, `p_answer_state`, `p_source`, optional `p_evidence_id`; returns the next revision version. `p_answer_state` is `confirmed`, `unknown`, `declined`, `not_applicable`, or `pending_follow_up`. Only `manual` and `driver_confirmed` sources are accepted as canonical answers. |
+| Engineer A | Save details | `POST /rest/v1/rpc/save_incident_details` with revision ID, expected version, nullable `p_occurred_at`, and nullable JSON-object `p_location`; returns the next version. Pass `null` when location permission is denied; manually corrected location is allowed. |
+| Engineer A | Repeatable group | `POST /rest/v1/rpc/create_incident_answer_group` with revision ID, expected version, form/group keys, and position; returns the group UUID. Answer upserts are unique for both scalar NULL-group rows and repeated-group rows. |
+| Engineer A | Reports/resume | Read `incidents`, `incident_revisions`, `incident_revision_forms`, `incident_answers`, `incident_answer_groups`, `conversation_turns`, `evidence`, and `signatures` through PostgREST. Owner-scoped RLS is authoritative; submitted revisions are read-only. |
+| Engineer C | Begin turn | `POST /rest/v1/rpc/begin_incident_turn` with `p_incident_revision_id`, stable `p_client_turn_id`, exactly one of `p_text` or `p_audio_evidence_id`, and `p_language`; returns persisted `turn_id`, status, transcript, proposals, and error code. Repeating the same ID/input returns the original turn; reusing the ID with different input returns `TURN_ID_REUSED`. |
+| Engineer C | Record provider result | `POST /rest/v1/rpc/record_incident_turn_result` with revision/turn IDs, status (`processing`, `completed`, `failed`), optional transcript/proposals, and safe error code; returns the persisted turn. Proposals are advisory only and never update `incident_answers`. Forward the driver's JWT; the RPC checks the owner and draft state. |
+| Engineer C | Evidence | Create metadata with `create_incident_evidence` (`p_incident_revision_id`, media type, byte size, optional description), upload to the returned exact path in private `incident-evidence`, then call `finalize_incident_evidence(p_evidence_id)`. Finalize checks object existence, MIME family/allowlist, and exact size. Upload replacement is allowed only for a pending/failed draft object; uploaded evidence cannot be replaced. Use Storage signed URLs for playback/viewing. |
+| Engineer A | Submit | `POST /functions/v1/submit-incident` with `incident_revision_id`, `expected_version`, UUID `signature_reference`, `auth_method` (`biometric` or `device_passcode`), and `device_description`. Success returns `status: submitted`, `driver_status: Submitted · awaiting review`, `report_reference`, `submitted_at`, and new version. A retry with the same confirmation reference returns the original result. |
+
+The expected version advances on answer, details, group, new-turn, and evidence create/finalize writes. Clients must use the returned version for the next mutation or submit. Submit validation returns HTTP 422 with `{ "code": "VALIDATION_FAILED", "issues": [{ "form_key", "field_key", "group_instance_id?", "code" }] }`. Other stable function errors include `AUTH_REQUIRED` (401), `NOT_ALLOWED` (403), `STALE_VERSION` / `INCIDENT_NOT_DRAFT` / `SIGNATURE_REFERENCE_REUSED` (409), and `RETRYABLE_FAILURE` (503). Database RPC errors carry SQLSTATE `P0001` with the stable code in `message`.
 
 ## Hosted Supabase deployment workflow
 
@@ -195,9 +233,8 @@ npm run supabase:functions:deploy
 
 ## Current next implementation steps
 
-1. Build seeded organization/profile/vehicle fixtures and invited test users.
-2. Implement `create_incident_draft` consumption in mobile flow.
-3. Replace function stubs with real validation + persistence.
-4. Add deterministic question eligibility and submission validation.
-5. Add end-to-end tests for cross-user isolation, required-field blocking, and idempotent submit.
+1. Engineer A consumes the draft, answer, details, and read contracts in the mobile flow.
+2. Engineer C implements provider processing and eligible-question planning using the turn/evidence persistence contracts.
+3. Replace the minimal backend fixture definitions with the reviewed complete form definitions and workbook branch rules.
+4. Verify hosted invite-only Auth settings and run physical-device, upload-retry, and full driver-journey acceptance outside the local database suite.
 

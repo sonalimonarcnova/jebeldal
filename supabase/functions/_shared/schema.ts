@@ -25,4 +25,6 @@ export const submitIncidentSchema = z.object({
   incident_revision_id: z.string().uuid(),
   expected_version: z.number().int().positive(),
   signature_reference: z.string().uuid(),
+  auth_method: z.enum(['biometric', 'device_passcode']),
+  device_description: z.string().trim().min(1).max(160),
 });

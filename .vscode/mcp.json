@@ -3,6 +3,25 @@
     "supabase": {
       "type": "http",
       "url": "https://mcp.supabase.com/mcp?project_ref=paitemheimctgiqarekt&features=docs%2Caccount%2Cdatabase%2Cdebugging%2Cdevelopment%2Cfunctions%2Cbranching%2Cfeedback%2Cnotebooks%2Cstorage"
+    },
+    "android-emulator": {
+      "type": "stdio",
+      "command": "C:\\Users\\sasmi\\AppData\\Roaming\\Python\\Python314\\Scripts\\uv.exe",
+      "args": [
+        "--directory",
+        "C:\\Users\\sasmi\\AppData\\Local\\AndroidMCP\\Android-MCP",
+        "run",
+        "--python",
+        "C:\\Python314\\python.exe",
+        "--locked",
+        "--no-sync",
+        "android-mcp-beta",
+        "--device",
+        "emulator-5554"
+      ],
+      "env": {
+        "ANDROID_MCP_ADB_PATH": "C:\\Users\\sasmi\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe"
+      }
     }
   }
 }

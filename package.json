@@ -3,7 +3,8 @@
   "private": true,
   "scripts": {
     "mobile:install": "npm --prefix apps/mobile install",
-    "mobile:start": "npm --prefix apps/mobile run start:hosted",
+    "mobile:start": "npm run mobile:start:infisical:dev",
+    "mobile:start:local": "npm --prefix apps/mobile run start:hosted",
     "mobile:start:infisical:dev": "npm --prefix apps/mobile run start:infisical:dev",
     "mobile:start:infisical:staging": "npm --prefix apps/mobile run start:infisical:staging",
     "mobile:start:infisical:prod": "npm --prefix apps/mobile run start:infisical:prod",

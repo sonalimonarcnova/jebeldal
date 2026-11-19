@@ -22,6 +22,7 @@ const accounts = [
     display_name: 'Dev Driver One',
     role: 'driver',
     assigned_vehicle_id: '22222222-2222-2222-2222-222222222221',
+    trip_id: '33333333-3333-4333-8333-333333333341',
   },
   {
     email: 'driver+dev2@jebel.local',
@@ -29,13 +30,7 @@ const accounts = [
     display_name: 'Dev Driver Two',
     role: 'driver',
     assigned_vehicle_id: '22222222-2222-2222-2222-222222222222',
-  },
-  {
-    email: 'manager+dev@jebel.local',
-    password: 'DevManager#201',
-    display_name: 'Dev Manager',
-    role: 'manager',
-    assigned_vehicle_id: null,
+    trip_id: '33333333-3333-4333-8333-333333333342',
   },
 ];
 
@@ -106,6 +101,35 @@ async function upsertProfile(userId, account) {
   return response.json();
 }
 
+async function upsertTripRecord(userId, account) {
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/trip_records?on_conflict=id`, {
+    method: 'POST',
+    headers: {
+      ...headers,
+      Prefer: 'resolution=merge-duplicates,return=minimal',
+    },
+    body: JSON.stringify([
+      {
+        id: account.trip_id,
+        organization_id: ORGANIZATION_ID,
+        driver_id: userId,
+        vehicle_id: account.assigned_vehicle_id,
+        started_at: '2026-11-18T14:00:00Z',
+        ended_at: '2026-11-18T18:00:00Z',
+        route: { origin: 'Austin, TX', destination: 'San Antonio, TX' },
+        purpose: 'fictional demo delivery',
+        hours_of_service: { status: 'fictional demo data' },
+        dvir_summary: { status: 'fictional demo data' },
+      },
+    ]),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed upserting trip for ${account.email} (${response.status}): ${text}`);
+  }
+}
+
 async function main() {
   const authUsers = await listAuthUsers();
   const userByEmail = new Map(authUsers.map((user) => [user.email?.toLowerCase(), user]));
@@ -115,6 +139,7 @@ async function main() {
     const existing = userByEmail.get(account.email.toLowerCase());
     const user = existing ?? (await createAuthUser(account));
     await upsertProfile(user.id, account);
+    await upsertTripRecord(user.id, account);
     seeded.push({
       email: account.email,
       password: account.password,
