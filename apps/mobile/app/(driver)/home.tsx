@@ -1,15 +1,12 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { router, useFocusEffect } from 'expo-router';
 import { useCallback, useState } from 'react';
 import {
-  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
   View,
   type GestureResponderEvent,
 } from 'react-native';
-import * as LocalAuthentication from 'expo-local-authentication';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { ActivityIndicator, HelperText, Text } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -27,8 +24,9 @@ import type { HomeTrip } from '../../src/features/home/model';
 import { loadLatestHomeTrip } from '../../src/features/home/repository';
 import { AppButton as Button } from '../../src/ui/AppButton';
 import { palette } from '../../src/ui/theme';
-
-const faceIdSetupKeyPrefix = 'jebeldal:face-id-ready:';
+import {
+  isFaceIdReady,
+} from '../../src/features/home/deviceAuth';
 
 function formatHomeDate(value: Date): string {
   return value.toLocaleDateString(undefined, {
@@ -145,8 +143,8 @@ export default function HomeRoute() {
 
       const userId = session?.user.id;
       if (userId) {
-        void AsyncStorage.getItem(`${faceIdSetupKeyPrefix}${userId}`)
-          .then((value) => setFaceIdReady(value === 'true'))
+        void isFaceIdReady(userId)
+          .then((value) => setFaceIdReady(value))
           .catch((error: unknown) => {
             setSetupError(describeFileError(error, 'Could not load device setup status.'));
           });
@@ -167,40 +165,6 @@ export default function HomeRoute() {
       setCreateError(error instanceof Error ? error.message : 'Could not create an incident draft.');
     } finally {
       setCreating(false);
-    }
-  };
-
-  const setupFaceId = async () => {
-    setSetupError(null);
-    const userId = session?.user.id;
-    if (!userId) {
-      setSetupError('Sign in again before setting up device authentication.');
-      return;
-    }
-    if (Platform.OS === 'web') {
-      setSetupError('Device biometric setup is available on an iOS or Android device.');
-      return;
-    }
-
-    try {
-      if (!(await LocalAuthentication.hasHardwareAsync())) {
-        throw new Error('This device does not support biometric authentication.');
-      }
-      if ((await LocalAuthentication.getEnrolledLevelAsync()) === LocalAuthentication.SecurityLevel.NONE) {
-        throw new Error('Set up Face ID or a fingerprint in your device settings first.');
-      }
-      const result = await LocalAuthentication.authenticateAsync({
-        promptMessage: 'Set up JebelDAL device authentication',
-        cancelLabel: 'Cancel',
-        disableDeviceFallback: true,
-      });
-      if (!result.success) {
-        throw new Error('Device authentication was not completed. Your setup is unchanged.');
-      }
-      await AsyncStorage.setItem(`${faceIdSetupKeyPrefix}${userId}`, 'true');
-      setFaceIdReady(true);
-    } catch (error) {
-      setSetupError(describeFileError(error, 'Device authentication could not be set up.'));
     }
   };
 
@@ -227,7 +191,12 @@ export default function HomeRoute() {
             <Pressable
               accessibilityRole="button"
               accessibilityLabel="Open profile"
-              onPress={() => router.navigate('/(driver)/profile')}
+              onPress={() =>
+                router.push({
+                  pathname: '/(auth)/profile',
+                  params: { returnTo: 'driver-profile' },
+                })
+              }
               style={({ pressed }) => [styles.profileAvatar, pressed ? styles.pressed : null]}
             >
               <Text variant="titleMedium" style={styles.avatarText}>
@@ -252,7 +221,7 @@ export default function HomeRoute() {
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel={faceIdReady ? 'Face ID set up on this device' : 'Set up Face ID'}
-                  onPress={() => void setupFaceId()}
+                  onPress={() => router.push('/(driver)/face')}
                   style={({ pressed }) => [styles.setupChip, pressed ? styles.pressed : null]}
                 >
                   <MaterialCommunityIcons
@@ -282,7 +251,12 @@ export default function HomeRoute() {
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel={`Open truck photos, ${photosAdded} of ${walkaroundPhotoCategories.length} added`}
-                  onPress={() => router.navigate('/(driver)/truck-photos')}
+                  onPress={() =>
+                    router.push({
+                      pathname: '/(driver)/files',
+                      params: { tab: 'photos' },
+                    })
+                  }
                   style={({ pressed }) => [styles.setupChip, pressed ? styles.pressed : null]}
                 >
                   <MaterialCommunityIcons
@@ -396,7 +370,12 @@ export default function HomeRoute() {
                     : 'your assigned unit'}`}
                   iconColor="#7C3AED"
                   iconBackground="#F5F0FF"
-                  onPress={() => router.navigate('/(driver)/truck-photos')}
+                  onPress={() =>
+                    router.push({
+                      pathname: '/(driver)/files',
+                      params: { tab: 'photos' },
+                    })
+                  }
                 />
               </View>
               {creating ? <ActivityIndicator accessibilityLabel="Creating incident report" /> : null}

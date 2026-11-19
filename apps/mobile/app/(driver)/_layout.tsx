@@ -124,6 +124,13 @@ export default function DriverTabsLayout() {
         }}
       />
       <Tabs.Screen
+        name="face"
+        options={{
+          title: 'Face setup',
+          href: null,
+        }}
+      />
+      <Tabs.Screen
         name="truck-photos"
         options={{
           title: 'Truck photos',

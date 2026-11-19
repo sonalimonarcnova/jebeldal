@@ -3,7 +3,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import { Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
-import { router, useFocusEffect } from 'expo-router';
+import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { ActivityIndicator, HelperText, Text } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -39,12 +39,14 @@ function statusLabel(files: DriverFile[]): 'missing' | 'pending' | 'failed' | 'a
 }
 
 export default function TruckPhotosRoute() {
+  const { setup } = useLocalSearchParams<{ setup?: string }>();
   const [files, setFiles] = useState<DriverFile[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [pendingUpload, setPendingUpload] = useState<PendingDriverFile | null>(null);
   const [busyCategory, setBusyCategory] = useState<DriverFileCategory | null>(null);
+  const inSetupFlow = setup === '1' || setup === 'true';
 
   const refreshFiles = useCallback(async () => {
     setLoading(true);
@@ -175,28 +177,46 @@ export default function TruckPhotosRoute() {
   return (
     <SafeAreaView style={styles.safeArea} edges={['top']}>
       <ScrollView contentContainerStyle={styles.content}>
-        <View style={styles.topBar}>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Back to files"
-            onPress={() => router.back()}
-            style={({ pressed }) => [styles.topButton, pressed ? styles.pressed : null]}
-            hitSlop={10}
-          >
-            <MaterialCommunityIcons name="arrow-left" size={20} color={palette.text} />
-            <Text variant="labelLarge" style={styles.topButtonText}>Back</Text>
-          </Pressable>
-          <Text variant="labelLarge" style={styles.stepText}>Step 4 of 4</Text>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Skip truck photo setup"
-            onPress={() => router.navigate('/(driver)/files')}
-            style={({ pressed }) => [styles.topButton, pressed ? styles.pressed : null]}
-            hitSlop={10}
-          >
-            <Text variant="labelLarge" style={styles.skipText}>Skip</Text>
-          </Pressable>
-        </View>
+        {inSetupFlow ? (
+          <View style={styles.topBar}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Back to documents"
+              onPress={() => router.replace({
+                pathname: '/(driver)/files',
+                params: { tab: 'documents', setup: '1' },
+              })}
+              style={({ pressed }) => [styles.topButton, pressed ? styles.pressed : null]}
+              hitSlop={10}
+            >
+              <MaterialCommunityIcons name="arrow-left" size={20} color={palette.text} />
+              <Text variant="labelLarge" style={styles.topButtonText}>Back</Text>
+            </Pressable>
+            <Text variant="labelLarge" style={styles.stepText}>Step 4 of 4</Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Skip truck photo setup"
+              onPress={() => router.replace('/(driver)/home')}
+              style={({ pressed }) => [styles.topButton, pressed ? styles.pressed : null]}
+              hitSlop={10}
+            >
+              <Text variant="labelLarge" style={styles.skipText}>Skip</Text>
+            </Pressable>
+          </View>
+        ) : (
+          <View style={styles.topBarSimple}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Back to files"
+              onPress={() => router.back()}
+              style={({ pressed }) => [styles.topButton, pressed ? styles.pressed : null]}
+              hitSlop={10}
+            >
+              <MaterialCommunityIcons name="arrow-left" size={20} color={palette.text} />
+              <Text variant="labelLarge" style={styles.topButtonText}>Back</Text>
+            </Pressable>
+          </View>
+        )}
 
         <View style={styles.header}>
           <Text variant="headlineMedium" style={styles.title}>Photograph your unit</Text>
@@ -264,10 +284,18 @@ export default function TruckPhotosRoute() {
 
         <Button
           mode="contained"
-          onPress={() => router.navigate('/(driver)/files')}
-          accessibilityLabel={`Finish setup with ${uploadedSidesCount} of ${walkaroundCategories.length} sides uploaded`}
+          onPress={() => {
+            if (inSetupFlow) {
+              router.replace('/(driver)/home');
+              return;
+            }
+            router.navigate('/(driver)/files');
+          }}
+          accessibilityLabel={`${inSetupFlow ? 'Continue' : 'Finish setup'} with ${uploadedSidesCount} of ${walkaroundCategories.length} sides uploaded`}
         >
-          {`Finish setup · ${uploadedSidesCount} of ${walkaroundCategories.length}`}
+          {inSetupFlow
+            ? `Continue · ${uploadedSidesCount} of ${walkaroundCategories.length} added`
+            : `Finish setup · ${uploadedSidesCount} of ${walkaroundCategories.length}`}
         </Button>
       </ScrollView>
     </SafeAreaView>
@@ -292,6 +320,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     flexDirection: 'row',
     justifyContent: 'space-between',
+  },
+  topBarSimple: {
+    alignItems: 'flex-start',
   },
   topButton: {
     alignItems: 'center',

@@ -11,7 +11,7 @@ const profileRowSchema = z.object({
   phone: z.string().nullable(),
   employee_id: z.string().nullable(),
   assigned_vehicle_id: postgresUuidSchema.nullable(),
-  preferred_language: z.string(),
+  preferred_language: z.enum(['en', 'es']),
   profile_completed_at: z.string().nullable(),
 });
 
@@ -34,7 +34,7 @@ export type DriverProfile = {
   displayName: string;
   phone: string;
   employeeId: string;
-  preferredLanguage: 'en';
+  preferredLanguage: 'en' | 'es';
   profileCompletedAt: string | null;
   vehicle: {
     unitNumber: string;
@@ -47,6 +47,7 @@ export type DriverProfile = {
 export type EditableDriverProfile = {
   displayName: string;
   phone: string;
+  preferredLanguage: 'en' | 'es';
 };
 
 export async function loadDriverProfile(userId: string): Promise<DriverProfile | null> {
@@ -129,7 +130,7 @@ export async function loadDriverProfile(userId: string): Promise<DriverProfile |
     displayName: profile.display_name,
     phone: profile.phone ?? '',
     employeeId: profile.employee_id ?? '',
-    preferredLanguage: 'en',
+    preferredLanguage: profile.preferred_language,
     profileCompletedAt: profile.profile_completed_at,
     vehicle,
     organizationName: organizationResult.data.display_name,
@@ -145,7 +146,7 @@ export async function updateDriverProfile(
     .update({
       display_name: profile.displayName.trim(),
       phone: profile.phone.trim() || null,
-      preferred_language: 'en',
+      preferred_language: profile.preferredLanguage,
     })
     .eq('user_id', userId)
     .select('user_id')

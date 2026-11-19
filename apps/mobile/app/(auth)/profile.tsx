@@ -7,7 +7,13 @@ import {
   StyleSheet,
   View,
 } from 'react-native';
-import { ActivityIndicator, Card, HelperText, Text, TextInput } from 'react-native-paper';
+import {
+  ActivityIndicator,
+  HelperText,
+  SegmentedButtons,
+  Text,
+  TextInput,
+} from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { useAuth } from '../../src/auth/AuthProvider';
@@ -28,16 +34,24 @@ export default function DriverProfileConfirmationRoute() {
   } = useAuth();
   const [displayName, setDisplayName] = useState(profile?.displayName ?? '');
   const [phone, setPhone] = useState(profile?.phone ?? '');
+  const [preferredLanguage, setPreferredLanguage] = useState<'en' | 'es'>(
+    profile?.preferredLanguage ?? 'en',
+  );
   const [submitting, setSubmitting] = useState(false);
   const [errorText, setErrorText] = useState<string | null>(null);
 
-  const handleBackToProfile = () => {
-    router.replace('/(driver)/profile');
+  const handleBack = () => {
+    if (returnToProfile) {
+      router.replace('/(driver)/profile');
+      return;
+    }
+    router.back();
   };
 
   useEffect(() => {
     setDisplayName(profile?.displayName ?? '');
     setPhone(profile?.phone ?? '');
+    setPreferredLanguage(profile?.preferredLanguage ?? 'en');
   }, [profile]);
 
   if (!session) {
@@ -67,8 +81,8 @@ export default function DriverProfileConfirmationRoute() {
     setSubmitting(true);
     setErrorText(null);
     try {
-      await confirmProfile({ displayName, phone });
-      router.replace(returnToProfile ? '/(driver)/profile' : '/(driver)/home');
+      await confirmProfile({ displayName, phone, preferredLanguage });
+      router.replace('/(driver)/face');
     } catch (error) {
       setErrorText(error instanceof Error ? error.message : 'Could not confirm driver profile.');
     } finally {
@@ -93,85 +107,125 @@ export default function DriverProfileConfirmationRoute() {
       >
         <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
           <View style={styles.header}>
-            {returnToProfile ? (
+            <View style={styles.headerTop}>
               <Button
                 mode="text"
                 icon="arrow-left"
-                accessibilityLabel="Back to profile"
-                onPress={handleBackToProfile}
+                accessibilityLabel={returnToProfile ? 'Back to profile' : 'Back'}
+                onPress={handleBack}
                 style={styles.backButton}
               >
                 Back
               </Button>
-            ) : null}
-            <Text variant="labelLarge" style={styles.eyebrow}>Profile confirmation</Text>
+              <Text variant="labelLarge" style={styles.stepText}>Step 1 of 4</Text>
+            </View>
             <Text variant="headlineMedium" style={styles.title}>Your profile</Text>
             <Text variant="bodyMedium" style={styles.subtitle}>
-              Confirm the roster details used for your incident reports.
+              We pulled this from your fleet roster. Fix anything that's off.
             </Text>
           </View>
 
-          <Card mode="elevated" style={styles.card}>
-            <Card.Content style={styles.form}>
-              <TextInput
-                mode="outlined"
-                label="Full name"
-                accessibilityLabel="Full name"
-                value={displayName}
-                onChangeText={setDisplayName}
-                disabled={submitting}
+          <View style={styles.profileCard}>
+            <View style={styles.initialsBadge}>
+              <Text variant="titleLarge" style={styles.initialsText}>
+                {displayName
+                  .split(/\s+/)
+                  .filter(Boolean)
+                  .slice(0, 2)
+                  .map((part) => part[0]?.toUpperCase())
+                  .join('') || 'DR'}
+              </Text>
+            </View>
+            <View style={styles.profileCardDetails}>
+              <Text variant="titleMedium" style={styles.profileName}>
+                {displayName.trim() || 'Driver'}
+              </Text>
+              <Text variant="bodySmall" style={styles.profileRole}>Driver</Text>
+            </View>
+          </View>
+
+          <View style={styles.form}>
+            <TextInput
+              mode="outlined"
+              label="Full name"
+              accessibilityLabel="Full name"
+              value={displayName}
+              onChangeText={setDisplayName}
+              disabled={submitting}
+            />
+            <TextInput
+              mode="outlined"
+              label="Mobile"
+              accessibilityLabel="Mobile"
+              keyboardType="phone-pad"
+              value={phone}
+              onChangeText={setPhone}
+              disabled={submitting}
+            />
+            <TextInput
+              mode="outlined"
+              label="Employee ID"
+              accessibilityLabel="Employee ID"
+              value={profile.employeeId || 'Not provided'}
+              editable={false}
+            />
+            <TextInput
+              mode="outlined"
+              label="Home terminal"
+              accessibilityLabel="Home terminal"
+              value={profile.organizationName || 'Not provided'}
+              editable={false}
+            />
+            <TextInput
+              mode="outlined"
+              label="Assigned unit"
+              accessibilityLabel="Assigned unit"
+              value={
+                profile.vehicle
+                  ? `${profile.vehicle.unitNumber} · ${profile.vehicle.makeModel ?? 'Vehicle'}`
+                  : 'No unit assigned'
+              }
+              editable={false}
+            />
+            <View style={styles.languageSection}>
+              <Text variant="bodyMedium" style={styles.languageLabel}>Report language</Text>
+              <SegmentedButtons
+                value={preferredLanguage}
+                onValueChange={(value) => {
+                  if (value === 'en' || value === 'es') {
+                    setPreferredLanguage(value);
+                  }
+                }}
+                density="small"
+                buttons={[
+                  {
+                    value: 'en',
+                    label: 'English',
+                    disabled: submitting,
+                    accessibilityLabel: 'English report language',
+                  },
+                  {
+                    value: 'es',
+                    label: 'Español',
+                    disabled: submitting,
+                    accessibilityLabel: 'Spanish report language',
+                  },
+                ]}
               />
-              <TextInput
-                mode="outlined"
-                label="Mobile"
-                accessibilityLabel="Mobile"
-                keyboardType="phone-pad"
-                value={phone}
-                onChangeText={setPhone}
-                disabled={submitting}
-              />
-              <TextInput
-                mode="outlined"
-                label="Employee ID"
-                accessibilityLabel="Employee ID"
-                value={profile.employeeId || 'Not provided'}
-                editable={false}
-              />
-              <TextInput
-                mode="outlined"
-                label="Assigned vehicle"
-                accessibilityLabel="Assigned vehicle"
-                value={
-                  profile.vehicle
-                    ? `${profile.vehicle.unitNumber} · ${profile.vehicle.makeModel ?? 'Vehicle'}`
-                    : 'No vehicle assigned'
-                }
-                editable={false}
-              />
-              <View style={styles.meta}>
-                <Text variant="bodyMedium">
-                  <Text style={styles.metaLabel}>Organization</Text>
-                  {`\n${profile.organizationName}`}
-                </Text>
-                <Text variant="bodyMedium">
-                  <Text style={styles.metaLabel}>Report language</Text>
-                  {'\nEnglish (the only supported MVP language)'}
-                </Text>
-              </View>
-              {errorText ? <HelperText type="error">{errorText}</HelperText> : null}
-              <Button
-                mode="contained"
-                onPress={() => void handleConfirm()}
-                disabled={submitting || !displayName.trim()}
-                loading={submitting}
-              >
-                Confirm profile
-              </Button>
-              <Button mode="text" onPress={() => void handleSignOut()} disabled={submitting}>
-                Sign out
-              </Button>
-            </Card.Content>
-          </Card>
+            </View>
+            {errorText ? <HelperText type="error">{errorText}</HelperText> : null}
+            <Button
+              mode="contained"
+              onPress={() => void handleConfirm()}
+              disabled={submitting || !displayName.trim()}
+              loading={submitting}
+            >
+              Continue
+            </Button>
+            <Button mode="text" onPress={() => void handleSignOut()} disabled={submitting}>
+              Sign out
+            </Button>
+          </View>
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -188,20 +242,26 @@ const styles = StyleSheet.create({
   },
   content: {
     alignSelf: 'center',
-    gap: 24,
+    gap: 20,
     padding: 24,
     width: '100%',
-    maxWidth: 600,
+    maxWidth: 520,
   },
   header: {
     alignItems: 'flex-start',
-    gap: 6,
+    gap: 8,
+  },
+  headerTop: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    width: '100%',
   },
   backButton: {
     marginLeft: -8,
   },
-  eyebrow: {
-    color: palette.primary,
+  stepText: {
+    color: palette.mutedText,
   },
   title: {
     color: palette.text,
@@ -209,24 +269,47 @@ const styles = StyleSheet.create({
   subtitle: {
     color: palette.mutedText,
   },
-  card: {
+  profileCard: {
+    alignItems: 'center',
+    backgroundColor: palette.surface,
     borderColor: palette.border,
     borderWidth: StyleSheet.hairlineWidth,
-    borderRadius: 20,
+    borderRadius: 16,
+    flexDirection: 'row',
+    gap: 12,
+    padding: 14,
+  },
+  initialsBadge: {
+    alignItems: 'center',
+    backgroundColor: palette.primaryContainer,
+    borderRadius: 22,
+    height: 44,
+    justifyContent: 'center',
+    width: 44,
+  },
+  initialsText: {
+    color: palette.primary,
+    fontWeight: '700',
+  },
+  profileCardDetails: {
+    flex: 1,
+    gap: 2,
+  },
+  profileName: {
+    color: palette.text,
+  },
+  profileRole: {
+    color: palette.mutedText,
   },
   form: {
-    gap: 16,
-    padding: 20,
+    gap: 14,
   },
-  meta: {
-    backgroundColor: palette.surfaceVariant,
-    borderRadius: 12,
-    gap: 12,
-    padding: 16,
+  languageSection: {
+    gap: 8,
+    marginTop: 2,
   },
-  metaLabel: {
-    color: palette.mutedText,
-    fontWeight: '600',
+  languageLabel: {
+    color: palette.text,
   },
   centered: {
     flex: 1,

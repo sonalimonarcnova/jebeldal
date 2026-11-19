@@ -1,7 +1,7 @@
 import { router } from 'expo-router';
 import { useState } from 'react';
 import { ScrollView, StyleSheet, View } from 'react-native';
-import { Avatar, Card, HelperText, Text } from 'react-native-paper';
+import { HelperText, Text } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { useAuth } from '../../src/auth/AuthProvider';
@@ -29,58 +29,109 @@ export default function DriverAccountRoute() {
   return (
     <SafeAreaView style={styles.safeArea}>
       <ScrollView contentContainerStyle={styles.content}>
-        <Text variant="headlineMedium" style={styles.title}>Profile</Text>
+        <View style={styles.header}>
+          <Text variant="headlineMedium" style={styles.title}>Your profile</Text>
+          <Text variant="bodyMedium" style={styles.subtitle}>
+            Keep your driver details current before filing incidents.
+          </Text>
+        </View>
         {profile ? (
-          <Card style={styles.card}>
-            <Card.Content style={styles.cardContent}>
-              <View style={styles.profileHeading}>
-                <Avatar.Icon
-                  size={64}
-                  icon="account-outline"
-                  color={palette.primary}
-                  accessible={false}
-                  accessibilityElementsHidden
-                  importantForAccessibility="no-hide-descendants"
-                  style={styles.avatar}
-                />
-                <View style={styles.flex}>
-                  <Text variant="titleLarge" style={styles.name}>{profile.displayName}</Text>
-                  <Text variant="bodyMedium" style={styles.secondary}>{profile.organizationName}</Text>
+          <View style={styles.panel}>
+            <View style={styles.profileCard}>
+              <View style={styles.initialsBadge}>
+                <Text variant="titleLarge" style={styles.initialsText}>
+                  {profile.displayName
+                    .split(/\s+/)
+                    .filter(Boolean)
+                    .slice(0, 2)
+                    .map((part) => part[0]?.toUpperCase())
+                    .join('') || 'DR'}
+                </Text>
+              </View>
+              <View style={styles.profileCardDetails}>
+                <Text variant="titleMedium" style={styles.name}>{profile.displayName}</Text>
+                <Text variant="bodySmall" style={styles.secondary}>Driver</Text>
+              </View>
+            </View>
+
+            <View style={styles.details}>
+              <View style={styles.detailRow}>
+                <Text variant="labelMedium" style={styles.label}>Full name</Text>
+                <Text variant="bodyLarge" style={styles.value}>{profile.displayName || 'Not provided'}</Text>
+              </View>
+              <View style={styles.detailRow}>
+                <Text variant="labelMedium" style={styles.label}>Mobile</Text>
+                <Text variant="bodyLarge" style={styles.value}>{profile.phone || 'Not provided'}</Text>
+              </View>
+              <View style={styles.detailRow}>
+                <Text variant="labelMedium" style={styles.label}>Employee ID</Text>
+                <Text variant="bodyLarge" style={styles.value}>{profile.employeeId || 'Not provided'}</Text>
+              </View>
+              <View style={styles.detailRow}>
+                <Text variant="labelMedium" style={styles.label}>Home terminal</Text>
+                <Text variant="bodyLarge" style={styles.value}>{profile.organizationName || 'Not provided'}</Text>
+              </View>
+              <View style={styles.detailRow}>
+                <Text variant="labelMedium" style={styles.label}>Assigned unit</Text>
+                <Text variant="bodyLarge" style={styles.value}>
+                  {profile.vehicle
+                    ? `${profile.vehicle.unitNumber} · ${profile.vehicle.makeModel ?? 'Vehicle'}`
+                    : 'No unit assigned'}
+                </Text>
+              </View>
+              <View style={styles.detailRow}>
+                <Text variant="labelMedium" style={styles.label}>Report language</Text>
+                <View style={styles.languageRow}>
+                  <View
+                    style={[
+                      styles.languageChip,
+                      profile.preferredLanguage === 'en' && styles.languageChipActive,
+                    ]}
+                  >
+                    <Text
+                      variant="labelMedium"
+                      style={[
+                        styles.languageChipLabel,
+                        profile.preferredLanguage === 'en' && styles.languageChipLabelActive,
+                      ]}
+                    >
+                      English
+                    </Text>
+                  </View>
+                  <View
+                    style={[
+                      styles.languageChip,
+                      profile.preferredLanguage === 'es' && styles.languageChipActive,
+                    ]}
+                  >
+                    <Text
+                      variant="labelMedium"
+                      style={[
+                        styles.languageChipLabel,
+                        profile.preferredLanguage === 'es' && styles.languageChipLabelActive,
+                      ]}
+                    >
+                      Español
+                    </Text>
+                  </View>
                 </View>
               </View>
-              <View style={styles.details}>
-                <View style={styles.detailRow}>
-                  <Text variant="labelMedium" style={styles.secondary}>Employee ID</Text>
-                  <Text variant="bodyLarge">{profile.employeeId || 'Not provided'}</Text>
-                </View>
-                <View style={styles.detailRow}>
-                  <Text variant="labelMedium" style={styles.secondary}>Mobile</Text>
-                  <Text variant="bodyLarge">{profile.phone || 'Not provided'}</Text>
-                </View>
-                <View style={styles.detailRow}>
-                  <Text variant="labelMedium" style={styles.secondary}>Assigned unit</Text>
-                  <Text variant="bodyLarge">{profile.vehicle?.unitNumber ?? 'Not assigned'}</Text>
-                </View>
-                <View style={styles.detailRow}>
-                  <Text variant="labelMedium" style={styles.secondary}>Report language</Text>
-                  <Text variant="bodyLarge">{profile.preferredLanguage.toUpperCase()}</Text>
-                </View>
-              </View>
-              <Button
-                icon="account-edit-outline"
-                mode="outlined"
-                accessibilityLabel="Review profile details"
-                onPress={() =>
-                  router.push({
-                    pathname: '/(auth)/profile',
-                    params: { returnTo: 'driver-profile' },
-                  })
-                }
-              >
-                Review profile details
-              </Button>
-            </Card.Content>
-          </Card>
+            </View>
+
+            <Button
+              icon="account-edit-outline"
+              mode="contained"
+              accessibilityLabel="Review profile details"
+              onPress={() =>
+                router.push({
+                  pathname: '/(auth)/profile',
+                  params: { returnTo: 'driver-profile' },
+                })
+              }
+            >
+              Edit profile details
+            </Button>
+          </View>
         ) : (
           <HelperText type="error">Driver profile is unavailable.</HelperText>
         )}
@@ -105,35 +156,52 @@ const styles = StyleSheet.create({
     backgroundColor: palette.background,
   },
   content: {
-    gap: 16,
-    padding: 20,
+    gap: 20,
+    padding: 24,
     width: '100%',
-    maxWidth: 720,
+    maxWidth: 520,
     alignSelf: 'center',
+  },
+  header: {
+    gap: 8,
   },
   title: {
     color: palette.text,
   },
-  card: {
+  subtitle: {
+    color: palette.mutedText,
+  },
+  panel: {
     backgroundColor: palette.surface,
     borderColor: palette.border,
-    borderRadius: 18,
+    borderRadius: 16,
     borderWidth: StyleSheet.hairlineWidth,
-  },
-  cardContent: {
-    gap: 20,
-    padding: 20,
-  },
-  profileHeading: {
-    alignItems: 'center',
-    flexDirection: 'row',
     gap: 16,
+    padding: 14,
   },
-  avatar: {
+  profileCard: {
+    alignItems: 'center',
+    backgroundColor: palette.surfaceVariant,
+    borderRadius: 12,
+    flexDirection: 'row',
+    gap: 12,
+    padding: 14,
+  },
+  initialsBadge: {
+    alignItems: 'center',
     backgroundColor: palette.primaryContainer,
+    borderRadius: 22,
+    height: 44,
+    justifyContent: 'center',
+    width: 44,
   },
-  flex: {
+  initialsText: {
+    color: palette.primary,
+    fontWeight: '700',
+  },
+  profileCardDetails: {
     flex: 1,
+    gap: 2,
   },
   name: {
     color: palette.text,
@@ -142,12 +210,44 @@ const styles = StyleSheet.create({
     color: palette.mutedText,
   },
   details: {
-    backgroundColor: palette.surfaceVariant,
-    borderRadius: 14,
-    gap: 16,
-    padding: 16,
+    borderColor: palette.border,
+    borderRadius: 12,
+    borderWidth: StyleSheet.hairlineWidth,
+    overflow: 'hidden',
   },
   detailRow: {
-    gap: 4,
+    borderBottomColor: palette.border,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    gap: 6,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  label: {
+    color: palette.mutedText,
+  },
+  value: {
+    color: palette.text,
+  },
+  languageRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  languageChip: {
+    backgroundColor: palette.surfaceVariant,
+    borderColor: palette.border,
+    borderRadius: 999,
+    borderWidth: 1,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+  languageChipActive: {
+    backgroundColor: palette.primaryContainer,
+    borderColor: palette.primary,
+  },
+  languageChipLabel: {
+    color: palette.mutedText,
+  },
+  languageChipLabelActive: {
+    color: palette.onPrimaryContainer,
   },
 });

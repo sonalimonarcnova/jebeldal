@@ -3,7 +3,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import { Alert, Linking, Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
-import { router, useFocusEffect } from 'expo-router';
+import { router, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { ActivityIndicator, HelperText, Text } from 'react-native-paper';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -98,6 +98,7 @@ function photoStatus(files: DriverFile[]): { label: string; tone: 'neutral' | 'e
 }
 
 export default function DriverFilesRoute() {
+  const { tab, setup } = useLocalSearchParams<{ tab?: string; setup?: string }>();
   const [files, setFiles] = useState<DriverFile[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -105,6 +106,17 @@ export default function DriverFilesRoute() {
   const [busyCategory, setBusyCategory] = useState<DriverFileCategory | null>(null);
   const [pendingUpload, setPendingUpload] = useState<PendingDriverFile | null>(null);
   const [activeTab, setActiveTab] = useState<ActiveTab>('documents');
+  const inSetupFlow = setup === '1' || setup === 'true';
+
+  useFocusEffect(
+    useCallback(() => {
+      if (tab === 'photos') {
+        setActiveTab('photos');
+      } else if (tab === 'documents') {
+        setActiveTab('documents');
+      }
+    }, [tab]),
+  );
 
   const refreshFiles = useCallback(async () => {
     setLoading(true);
@@ -307,7 +319,14 @@ export default function DriverFilesRoute() {
   };
 
   const handleRetakeWalkaround = async () => {
-    router.navigate('/(driver)/truck-photos');
+    if (inSetupFlow) {
+      router.push({
+        pathname: '/(driver)/truck-photos',
+        params: { setup: '1' },
+      });
+      return;
+    }
+    router.push('/(driver)/truck-photos');
   };
 
   const documentRows = useMemo(
@@ -323,13 +342,51 @@ export default function DriverFilesRoute() {
     [files, busyCategory],
   );
 
+  const uploadedDocumentSlotsCount = useMemo(
+    () => documentSlots.filter((slot) =>
+      slot.categories.every((category) =>
+        files.some((file) => file.category === category && file.uploadStatus === 'uploaded'))).length,
+    [files],
+  );
+
   return (
     <SafeAreaView style={styles.safeArea} edges={['top']}>
       <ScrollView contentContainerStyle={styles.content}>
+        {inSetupFlow ? (
+          <View style={styles.setupTopBar}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Back"
+              onPress={() => router.replace('/(driver)/face')}
+              style={({ pressed }) => [styles.setupTopButton, pressed ? styles.pressed : null]}
+              hitSlop={10}
+            >
+              <MaterialCommunityIcons name="arrow-left" size={20} color={palette.text} />
+              <Text variant="labelLarge" style={styles.setupTopButtonText}>Back</Text>
+            </Pressable>
+            <Text variant="labelLarge" style={styles.setupStepText}>Step 3 of 4</Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Skip documents"
+              onPress={() => router.replace({
+                pathname: '/(driver)/truck-photos',
+                params: { setup: '1' },
+              })}
+              style={({ pressed }) => [styles.setupTopButton, pressed ? styles.pressed : null]}
+              hitSlop={10}
+            >
+              <Text variant="labelLarge" style={styles.setupSkipText}>Skip</Text>
+            </Pressable>
+          </View>
+        ) : null}
         <View style={styles.header}>
-          <Text variant="headlineLarge" style={styles.title}>Files</Text>
+          <Text variant="headlineLarge" style={styles.title}>
+            {inSetupFlow ? 'Drop your documents' : 'Files'}
+          </Text>
           <Text variant="bodyLarge" style={styles.subtitle}>
-            Everything your safety team or insurer may ask for.
+            {inSetupFlow
+              ? 'Scan, pick a photo, or drop a file. We read the dates so you get a heads-up before anything expires.'
+              : 'Everything your safety team or insurer may ask for.'}
           </Text>
           <View style={styles.segmented} accessibilityRole="tablist" accessibilityLabel="File type">
             <Pressable
@@ -422,6 +479,18 @@ export default function DriverFilesRoute() {
                 {isBusy ? <ActivityIndicator size="small" accessibilityLabel={`Uploading ${slot.label}`} /> : null}
               </Pressable>
             ))}
+            {inSetupFlow ? (
+              <Button
+                mode="contained"
+                onPress={() => router.replace({
+                  pathname: '/(driver)/truck-photos',
+                  params: { setup: '1' },
+                })}
+                accessibilityLabel={`Continue with ${uploadedDocumentSlotsCount} of ${documentSlots.length} document slots added`}
+              >
+                {`Continue · ${uploadedDocumentSlotsCount} of ${documentSlots.length} added`}
+              </Button>
+            ) : null}
           </View>
         ) : null}
 
@@ -491,6 +560,31 @@ const styles = StyleSheet.create({
     paddingHorizontal: 18,
     paddingTop: 14,
     width: '100%',
+  },
+  setupTopBar: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  setupTopButton: {
+    alignItems: 'center',
+    borderRadius: 12,
+    flexDirection: 'row',
+    gap: 4,
+    minHeight: 40,
+    paddingHorizontal: 8,
+  },
+  setupTopButtonText: {
+    color: palette.text,
+    fontWeight: '600',
+  },
+  setupStepText: {
+    color: palette.mutedText,
+    fontWeight: '600',
+  },
+  setupSkipText: {
+    color: palette.primary,
+    fontWeight: '700',
   },
   header: {
     gap: 8,
