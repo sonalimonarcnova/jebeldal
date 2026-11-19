@@ -28,55 +28,72 @@ driver confirms  ──►  saveAcceptedProposals()  ── rpc save_incident_an
 
 ## 1. `POST /functions/v1/process-incident-turn`
 
-JWT required (the driver's session). Exactly one of `text` or `audio_evidence_id`.
+JWT required (the driver's session). Exactly one of `text` or `audio_evidence_id`. The function uses the team's
+`_shared/backend.ts` helpers (`authenticateRequest`, `readJsonResponse`, `errorResponse`) and their error envelope.
 
 ```jsonc
 // request
 {
   "incident_revision_id": "uuid",
-  "client_turn_id": "uuid",            // one per spoken/typed answer; reuse it on retry
-  "question_key": "what_happened",     // "form_key.field_key" or a bare field key (auto form preferred)
+  "client_turn_id": "…",               // one per spoken/typed answer; reuse it on retry
+  "form_key": "auto",                  // optional: the pinned question from select-next-question …
+  "field_key": "what_happened",        // … (send both or neither)
+  "question_key": "what_happened",     // optional alternative: "form_key.field_key" or a bare field key
   "audio_evidence_id": "uuid",         // an evidence row in upload_status 'uploaded'
   "text": "…"                          // ≤ 12 000 chars (begin_incident_turn limit)
 }
 ```
 
+The current question is optional: without it everything in the catalog is still extracted, but the story field
+only gets the full transcript when it is the current question. When given, it is listed first in the prompt.
+
 ```jsonc
-// 200
+// 200 — a superset of what questionFlow.ts parseProcessedTurnResponse reads (turn_id, status)
 {
   "turn_id": "uuid",
+  "client_turn_id": "…",
   "status": "completed",
   "transcript": "A silver sedan cut in front of me … Front bumper is bent.",
   "applied": [
-    { "form_key": "auto", "field_key": "property_damaged", "value": true,  "confidence": 0.9,
-      "evidence_quote": "my trailer clipped the fence of the gas station" },
-    { "form_key": "auto", "field_key": "what_happened",    "value": "A silver sedan cut in …", "confidence": 1,
+    { "form_key": "auto", "field_key": "involved", "value": ["another_vehicle", "object"], "confidence": 0.9,
+      "evidence_quote": "A silver sedan cut in front of me … my trailer clipped the fence" },
+    { "form_key": "auto", "field_key": "what_happened", "value": "A silver sedan cut in …", "confidence": 1,
       "evidence_quote": "A silver sedan cut in …" }
   ],
-  "suggested": [],
-  "latency_ms": { "stt": 0, "llm": 2669 },
+  "suggested": [
+    { "form_key": "auto", "field_key": "weather_road", "value": ["clear"], "confidence": 0.4, "evidence_quote": "…" }
+  ],
+  "latency_ms": { "stt": 0, "llm": 2434 },
   "mode": "xai"                        // mock | groq | xai | live
 }
 ```
 
-`value` types follow the field definition: `text` / `long_text` / `phone` / `email` → string, `enum` → string,
-`multi_enum` → string[], `boolean` → `true` / `false` (real JSON booleans, as `save_incident_answer` expects).
+`value` types follow the field definition and use its **exact option values** (e.g. `our_yard_or_terminal`,
+`yes_i_can_drive_it`, `none`): `text` / `long_text` / `phone` / `email` → string, `enum` → string,
+`multi_enum` → string[], `boolean` → `true` / `false` (JSON booleans, as `save_incident_answer` expects).
 
 ```jsonc
-// error
-{ "code": "PROVIDER_UNAVAILABLE" | "VALIDATION_FAILED" | "NOT_ALLOWED" | "INCIDENT_NOT_DRAFT",
-  "message": "driver-safe text", "retryable": true }
+// error — _shared/backend.ts envelope (status comes from the code)
+{ "code": "VALIDATION_FAILED", "message": "driver-safe text", "retryable": false }
 ```
 
 | Situation | HTTP | code | retryable |
 |---|---|---|---|
-| no / bad JWT, not the reporter's revision | 401 / 403 | `NOT_ALLOWED` | no |
+| no / bad JWT | 401 | `AUTH_REQUIRED` | no |
+| not the reporter's revision / evidence | 403 | `NOT_ALLOWED` | no |
 | revision submitted | 409 | `INCIDENT_NOT_DRAFT` | no |
-| bad body, unknown `question_key`, recording not uploaded / not audio / too small, no words heard | 400 | `VALIDATION_FAILED` | no |
-| same `client_turn_id` with different input (`TURN_ID_REUSED`) | 400 | `VALIDATION_FAILED` | no |
-| turn still processing (< 60 s) | 409 | `PROVIDER_UNAVAILABLE` | yes |
-| STT / LLM down, timeout (20 s each), 429, 5xx; DB/RPC failure | 503 | `PROVIDER_UNAVAILABLE` | yes |
+| same `client_turn_id` with different input | 409 | `TURN_ID_REUSED` | no |
+| bad body, no triggered forms, recording not uploaded / not audio / too small, no words heard | 400 | `VALIDATION_FAILED` | no |
+| STT / LLM down, timeout (20 s each), 429, 5xx | 503 | `PROVIDER_UNAVAILABLE` | yes |
 | provider auth error (401 / 403) or missing keys | 503 | `PROVIDER_UNAVAILABLE` | no |
+| turn still processing (< 60 s), storage / DB / RPC hiccup | 503 | `RETRYABLE_FAILURE` | yes |
+| unexpected error | 500 | `INTERNAL_ERROR` | yes |
+
+The app's `processTurn` accepts all of these and fills in a message / retryable default when the body has only
+`{ code }` (as `backendErrorResponse` sends).
+
+**Profile completion.** `create_incident_draft` raises `PROFILE_INCOMPLETE` until the driver has confirmed their
+profile (`rpc complete_driver_profile`). The curl scripts call it first.
 
 **Idempotency.** `begin_incident_turn` keys turns on `(incident_revision_id, client_turn_id)` and an md5 of the
 input. A completed turn returns the **byte-identical** first response, even after the report is submitted. A failed
@@ -102,27 +119,36 @@ Rejected proposals, the catalog's form list and any stub fallback are stored wit
 
 ### The extraction catalog
 
-Built per request from `incident_revision_forms` (`activation_status = 'triggered'`) joined to their
-`form_definitions` version. Fields are walked through `fields` / `sections` like `private.definition_fields()`.
+Built per request from the **interview graph** (`form_sets.definition.interview_graph`, 38 nodes), not from all
+~160 definition fields. That keeps the prompt to about 26 entries (≈ 2.5 s with Grok) and matches exactly what
+`select-next-question` asks.
+
+1. Load the revision's **triggered** forms (`incident_revision_forms.activation_status = 'triggered'`) and their
+   pinned `form_definitions` versions.
+2. Run the team's own `prepareInterviewGraph()` (`_shared/interview.mjs`) to pin each node to a single scalar field
+   via `forms_source` → `form_key_map`. Nodes in untriggered forms, or that match ambiguously, are left out.
+3. Turn each pinned field into an entry keyed `form_key.field_key`. The prompt is the node's question text, the form
+   label goes into the description, and options are the definition's own `value`s with labels as meanings.
 
 | Definition type | Proposed as |
 |---|---|
 | `boolean` | enum `["true","false"]` → returned as JSON boolean |
-| `enum` / `multi_enum` | the option `value`s (labels go into the prompt) |
+| `enum` / `multi_enum` | the definition's option `value`s (labels go into the prompt) |
 | `text`, `long_text`, `phone`, `email` | free text (respects `validation.maxLength`) |
-| `number`, `currency`, `date`, `address`, `media`, `repeated_group` (+ children) | skipped and logged |
+| `number`, `currency`, `date`, `address`, `media` | skipped (`catalog_skipped` log) |
+| a node that maps to a section heading (e.g. GL `property_damaged`) | skipped (`not_a_scalar_field`) |
+| a node whose field exists only inside a `repeated_group` | skipped and logged as `repeated_group_fields` |
 
-Prompt text comes from `question` → `prompt` → `label` → the humanised key; the description from `description` or
-`help`. A field with `narrative: true` is the driver's story; until definitions carry that flag, `what_happened` is
-treated as narrative.
+**Story field:** a field with `narrative: true`, otherwise the graph's first node whose question reads "What
+happened?" with a text field (today `auto.what_happened`). No key is hard-coded.
 
-The catalog follows the triggers: once `property_damaged = true` is saved, `general_liability` becomes triggered and
-the next turn can propose `general_liability.claim_details`.
+The catalog follows the triggers. Saving `involved = ["another_vehicle", "object"]` triggers `general_liability`, and
+the next turn can propose `general_liability.place_type` / `property_owner`.
 
-**Fallback:** if a triggered form's definition has no usable fields, the old stub catalog
-(`process-incident-turn/catalog.ts`) is used for that form and a `catalog_degraded` log line is written. Stub fields
-are **not** in the definition, so `save_incident_answer` will refuse them. The fallback keeps extraction useful
-but those answers cannot be saved.
+**Fallbacks** (logged as `catalog_fallback`):
+- No interview graph, or no node pinned: every supported scalar field of the triggered forms is used.
+- A form with no usable fields at all: the old stub catalog (`catalog.ts`) is used for it. Stub fields are not in
+  the definition, so `save_incident_answer` refuses them.
 
 ## 2. RPCs used
 
@@ -196,21 +222,20 @@ A phone on Wi-Fi needs `EXPO_PUBLIC_SUPABASE_URL=http://<laptop LAN IP>:55421`.
 ## 5. Tests
 
 ```
-node scripts/test-voice.mjs                     # function: validation, catalog, providers, audio, mock (60)
-npm --prefix apps/mobile test                   # Eng B's phase-1 tests + saveProposals (17)
+node scripts/test-voice.mjs                     # function: validation, graph catalog (real seed.sql), providers, audio, mock (69)
+npm --prefix apps/mobile test                   # team's mobile tests + saveProposals (34)
+node --test supabase/tests/interview-graph-seed.test.mjs supabase/tests/interview-planner.test.mjs   # team (18)
 npm run mobile:typecheck
 powershell -File scripts/curl/process-incident-turn.ps1   # text turn + idempotent replay against local
 ```
 
 ## 6. Known gaps
 
-- **Placeholder form definitions.** `auto` has only `what_happened` (long_text) and five booleans
-  (`property_damaged`, `delivery_work`, `injuries`, `other_vehicle`, `police`). GL and WC have one long-text field
-  each. There are no labels, options or descriptions, so prompts use humanised keys. Most of what a driver says
-  (truck damage zones, weather, police report number, witnesses, place type) has **no field to land in**; it stays in
-  `what_happened`. Extraction quality will improve as soon as the real 38-question definitions are seeded (E1).
-- **Narrative flag.** Definitions don't mark the story field; `what_happened` is hard-coded as narrative in
-  `form_catalog.ts` until a `narrative: true` property exists.
+- **Graph nodes that pin to nothing.** Some nodes map to a section heading (GL `property_damaged`) or only exist in
+  another form (e.g. `delivery_work` is in `auto` but the graph says GL), so voice can't fill them. Fixing the
+  graph's `forms_source` or the definitions fixes both voice and the planner.
+- **Narrative flag.** No definition marks the story field yet; it is found from the "What happened?" question text.
+  Adding `narrative: true` to the field would make that explicit.
 - **No provenance on answers.** `save_incident_answer` accepts only `source` `manual | driver_confirmed` and has no
   confidence / evidence-quote / turn parameters. Voice answers are stored as `driver_confirmed` without a link to
   their turn. The evidence quote lives only in the turn's stored proposals.

@@ -27,6 +27,10 @@ TOKEN="$(curl -sS -X POST "$SUPABASE_URL/auth/v1/token?grant_type=password" \
   -H "apikey: $SUPABASE_ANON_KEY" -H 'Content-Type: application/json' -d "$LOGIN_BODY" | json_get access_token)"
 [[ -n "$TOKEN" && "$TOKEN" != "undefined" ]] || { echo "Sign-in failed" >&2; exit 1; }
 
+echo "1b. Confirm profile (rpc complete_driver_profile; drafts need a completed profile, idempotent)"
+curl -sS -o /dev/null -X POST "$SUPABASE_URL/rest/v1/rpc/complete_driver_profile" \
+  -H "apikey: $SUPABASE_ANON_KEY" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{}'
+
 echo "2. Create draft (rpc create_incident_draft)"
 REVISION_ID="$(curl -sS -X POST "$SUPABASE_URL/rest/v1/rpc/create_incident_draft" \
   -H "apikey: $SUPABASE_ANON_KEY" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{}' | tr -d '"')"

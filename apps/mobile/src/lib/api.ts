@@ -19,6 +19,7 @@ export type TurnProposal = z.infer<typeof proposalSchema>;
 
 export const processTurnResponseSchema = z.object({
   turn_id: z.string(),
+  client_turn_id: z.string().optional(),
   status: z.literal('completed'),
   transcript: z.string(),
   /** confidence ≥ 0.8 and explicitly stated — safe to save after the driver confirms */
@@ -30,23 +31,52 @@ export const processTurnResponseSchema = z.object({
 });
 export type ProcessTurnResponse = z.infer<typeof processTurnResponseSchema>;
 
-export const contractErrorCodes = ['PROVIDER_UNAVAILABLE', 'VALIDATION_FAILED', 'NOT_ALLOWED', 'INCIDENT_NOT_DRAFT'] as const;
+/** Error codes of the team's _shared/backend.ts envelope ({ code, message?, retryable? }). */
+export const contractErrorCodes = [
+  'AUTH_REQUIRED',
+  'NOT_ALLOWED',
+  'INCIDENT_NOT_DRAFT',
+  'TURN_ID_REUSED',
+  'VALIDATION_FAILED',
+  'PROVIDER_UNAVAILABLE',
+  'RETRYABLE_FAILURE',
+  'INTERNAL_ERROR',
+  'METHOD_NOT_ALLOWED',
+] as const;
+type ContractErrorCode = (typeof contractErrorCodes)[number];
 
+const RETRYABLE_BY_DEFAULT = new Set<ContractErrorCode>(['PROVIDER_UNAVAILABLE', 'RETRYABLE_FAILURE', 'INTERNAL_ERROR']);
+const DEFAULT_MESSAGES: Record<ContractErrorCode, string> = {
+  AUTH_REQUIRED: 'Sign in again to continue.',
+  NOT_ALLOWED: 'You cannot change this report.',
+  INCIDENT_NOT_DRAFT: 'This report was already submitted.',
+  TURN_ID_REUSED: 'This answer was already sent with different content.',
+  VALIDATION_FAILED: 'That answer could not be accepted.',
+  PROVIDER_UNAVAILABLE: 'Voice processing is unavailable. Try again or type your answer.',
+  RETRYABLE_FAILURE: 'Something went wrong. Please try again.',
+  INTERNAL_ERROR: 'Something went wrong. Please try again.',
+  METHOD_NOT_ALLOWED: 'Unexpected request.',
+};
+
+/** `message` and `retryable` are optional: backendErrorResponse() sends only `{ code }`. */
 export const apiErrorSchema = z.object({
   code: z.enum(contractErrorCodes),
-  message: z.string(),
-  retryable: z.boolean(),
+  message: z.string().optional(),
+  retryable: z.boolean().optional(),
 });
 
 /** Contract codes plus client-side ones: no network, or a response that did not match the contract. */
-export type ApiErrorCode = (typeof contractErrorCodes)[number] | 'NETWORK' | 'BAD_RESPONSE';
+export type ApiErrorCode = ContractErrorCode | 'NETWORK' | 'BAD_RESPONSE';
 export type ApiResult<T> = { ok: true; data: T } | { ok: false; code: ApiErrorCode; retryable: boolean; message: string };
 
 export type ProcessTurnInput = {
   incident_revision_id: string;
   /** Generate once per spoken/typed answer and reuse it on retry (server is idempotent on it). */
   client_turn_id: string;
-  question_key: string;
+  /** Current question: "form.field" / bare field key, or the pinned (form_key, field_key) from select-next-question. */
+  question_key?: string;
+  form_key?: string;
+  field_key?: string;
 } & ({ audio_evidence_id: string; text?: never } | { text: string; audio_evidence_id?: never });
 
 const NETWORK_ERROR = { ok: false, code: 'NETWORK', retryable: true, message: 'No connection. Check your signal and try again.' } as const;
@@ -57,9 +87,12 @@ async function errorFromInvoke(error: unknown): Promise<Extract<ApiResult<never>
     const response = error.context as Response;
     const body: unknown = await response.json().catch(() => null);
     const parsed = apiErrorSchema.safeParse(body);
-    if (parsed.success) return { ok: false, ...parsed.data };
+    if (parsed.success) {
+      const { code, message, retryable } = parsed.data;
+      return { ok: false, code, message: message ?? DEFAULT_MESSAGES[code], retryable: retryable ?? RETRYABLE_BY_DEFAULT.has(code) };
+    }
     // Gateway errors (e.g. expired JWT → 401) are not in the contract shape.
-    if (response.status === 401) return { ok: false, code: 'NOT_ALLOWED', retryable: false, message: 'Sign in again to continue.' };
+    if (response.status === 401) return { ok: false, code: 'AUTH_REQUIRED', retryable: false, message: DEFAULT_MESSAGES.AUTH_REQUIRED };
     return BAD_RESPONSE;
   }
   if (error instanceof FunctionsFetchError || error instanceof FunctionsRelayError) return NETWORK_ERROR;

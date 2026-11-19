@@ -12,7 +12,7 @@ const defs = [
           key: 'scene',
           type: 'section',
           fields: [
-            { key: 'what_happened', type: 'long_text', required: true },
+            { key: 'what_happened', type: 'long_text', required: true, question: 'What happened?' },
             { key: 'police', type: 'boolean', required: true, label: 'Did the police come?' },
             { key: 'weather', type: 'multi_enum', options: [{ value: 'rain', label: 'Rain' }, { value: 'fog' }] },
             { key: 'place', type: 'enum', options: ['yard', 'road'] },
@@ -48,8 +48,8 @@ Deno.test('type mapping: boolean → enum [true,false]; enum / multi_enum → op
 Deno.test('unsupported types and repeated groups (with their children) are skipped and reported', () => {
   const { skipped } = buildFormCatalog([{ form_key: 'auto', form_version: 1 }], defs);
   deepStrictEqual(skipped, [
-    { form_key: 'auto', field_key: 'speed_mph', type: 'number' },
     { form_key: 'auto', field_key: 'witness', type: 'repeated_group' },
+    { form_key: 'auto', field_key: 'speed_mph', type: 'number' },
   ]);
 });
 

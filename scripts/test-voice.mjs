@@ -11,6 +11,7 @@ const files = [
   'supabase/functions/process-incident-turn/providers.test.ts',
   'supabase/functions/process-incident-turn/audio.test.ts',
   'supabase/functions/process-incident-turn/form_catalog.test.ts',
+  'supabase/functions/process-incident-turn/interview_catalog.test.ts',
 ];
 
 const tests = [];

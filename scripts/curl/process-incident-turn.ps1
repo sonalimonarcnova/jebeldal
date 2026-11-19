@@ -39,6 +39,10 @@ if ($login.status -ne 200) { throw "Sign-in failed ($($login.status))" }
 $token = ($login.body | ConvertFrom-Json).access_token
 $auth = @{ apikey = $anon; Authorization = "Bearer $token" }
 
+Write-Host '1b. Confirm profile (rpc complete_driver_profile; drafts need a completed profile, idempotent)'
+$profile = Invoke-Json Post "$api/rest/v1/rpc/complete_driver_profile" $auth @{}
+if ($profile.status -ne 200) { throw "complete_driver_profile failed ($($profile.status)): $($profile.body)" }
+
 Write-Host '2. Create draft (rpc create_incident_draft)'
 $draft = Invoke-Json Post "$api/rest/v1/rpc/create_incident_draft" $auth @{}
 if ($draft.status -ne 200) { throw "create_incident_draft failed ($($draft.status)): $($draft.body)" }

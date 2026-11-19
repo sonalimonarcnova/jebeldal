@@ -16,7 +16,7 @@ const seededAuto = buildFormCatalog(
       version: 1,
       definition: {
         fields: [
-          { key: 'what_happened', type: 'long_text', required: true },
+          { key: 'what_happened', type: 'long_text', required: true, question: 'What happened?' },
           { key: 'property_damaged', type: 'boolean', required: true },
           { key: 'delivery_work', type: 'boolean', required: true },
           { key: 'injuries', type: 'boolean', required: true },

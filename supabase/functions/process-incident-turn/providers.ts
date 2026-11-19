@@ -223,10 +223,13 @@ export function buildExtractionInstructions(questionKey: string, catalog: Catalo
 
   return [
     'You extract answers for a truck driver incident report from what the driver said.',
-    `The current question is "${questionKey}" — answer it first if the transcript answers it.`,
+    questionKey
+      ? `The current question is "${questionKey}" (listed first) — answer it first if the transcript answers it.`
+      : 'There is no specific current question.',
     'Also extract any other question below that the transcript clearly answers.',
     'Rules:',
     '- Never invent facts. If something is not said or clearly implied, leave it out.',
+    '- Only list questions the transcript answers. Do NOT output an entry for an unanswered question — no empty values, no placeholders, no confidence-0 entries.',
     '- evidence_quote must be copied verbatim from the transcript (a short exact substring).',
     "- A value must be fully supported by its evidence_quote. If it needs two separate parts of the transcript, use those quotes joined with ' … '.",
     "- Questions about damaged property mean ONLY third-party property (fences, buildings, poles, other people's goods) — never the driver's own truck or trailer. Damage to the driver's own truck belongs only in questions about the truck.",
@@ -447,9 +450,12 @@ export const MOCK_RULES: readonly MockRule[] = [
   { field: 'weather_road', value: 'fog', pattern: /\bfog(?:gy)?\b/i },
   { field: 'weather_road', value: 'rain', pattern: /\brain(?:ing|y)?\b/i },
   { field: 'weather_road', value: 'ice_snow', pattern: /\b(?:snow(?:ing|y)?|icy)\b/i },
+  { field: 'weather_road', value: 'ice_or_snow', pattern: /\b(?:snow(?:ing|y)?|icy)\b/i },
   { field: 'weather_road', value: 'clear', pattern: /\bclear\b/i },
   { field: 'place_type', value: 'our_yard', pattern: /\bour yard\b/i },
+  { field: 'place_type', value: 'our_yard_or_terminal', pattern: /\bour yard\b/i },
   { field: 'place_type', value: 'customer_site', pattern: /\bcustomer'?s? (?:dock|site)\b/i },
+  { field: 'place_type', value: 'customer_s_site', pattern: /\bcustomer'?s? (?:dock|site)\b/i },
   { field: 'injuries', value: 'no_one', pattern: /\b(?:nobody|no one|no-one)\s+(?:was\s+|got\s+)?(?:hurt|injured)\b/i },
   { field: 'injuries', value: 'false', pattern: /\b(?:nobody|no one|no-one)\s+(?:was\s+|got\s+)?(?:hurt|injured)\b/i },
   { field: 'injuries', value: 'me', pattern: /\b(?:hurt|injured) my\b/i },
@@ -457,6 +463,7 @@ export const MOCK_RULES: readonly MockRule[] = [
   { field: 'truck_damage', value: 'front_bumper', pattern: /\bfront bumper\b/i },
   { field: 'truck_damage', value: 'rear', pattern: /\b(?:rear bumper|revers(?:ing|ed))\b/i },
   { field: 'truck_damage', value: 'no_damage', pattern: /\btruck is fine\b/i },
+  { field: 'truck_damage', value: 'none', pattern: /\btruck is fine\b/i },
   { field: 'drivable', value: 'needs_tow', pattern: /\btow(?:ed|ing)?\b/i },
   { field: 'police', value: 'came', pattern: /\bpolice (?:came|showed up|arrived)\b/i },
   { field: 'police', value: 'true', pattern: /\bpolice (?:came|showed up|arrived)\b/i },
